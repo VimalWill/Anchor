@@ -303,7 +303,9 @@ def main():
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
-    config = OmegaConf.create(OmegaConf.to_container(OmegaConf.load(args.cfg), resolve=True))
+    # Resolve model fields on access; training-only environment variables such
+    # as TTT_ADAPTER are not required for this diagnostic.
+    config = OmegaConf.load(args.cfg)
     config.model.pretrained_model_name_or_path = args.ckpt
     config.model.max_length = args.seq_len
     model_config = build_model_config(config)
