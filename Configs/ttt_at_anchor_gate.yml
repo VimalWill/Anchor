@@ -36,9 +36,16 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
-  lr: 0.01   # matches OpenSparseLLMs/Linearization lolcats_at; was 0.0002,
-           # 50x below it. Stage 1 trains only freshly-initialised TTT
-           # params (no LoRA), the same regime the reference runs at 0.01.
+  # NO explicit schedule here: Anchor-F is NOT being retrained, so its
+  # checkpoint keeps the ReduceLROnPlateau default. Anchor-I must match it or
+  # the Anchor-F vs Anchor-I contrast -- the headline, 12.6 MB against 201 MB
+  # -- confounds the read-map fix with a schedule change. The ONLY intended
+  # difference in this re-run is the fp32 ReaderOutputAlignment. The Mistral
+  # arms do select linear; that cross-backbone difference is stated, not hidden.
+  lr: 0.0002   # NOT 0.01. The file previously said 0.01 (the lolcats_at
+               # reference) but anchor_v2 was trained at 0.0002 and 0.01 was
+               # measured to diverge here: MSE 30.3 -> 9.5 while CE went
+               # 6.83 -> 9.51. The repo did not reproduce its own results.
   epochs: 1
   max_steps: 500   # ~26M tokens, matching lolcats_at's 2 epochs of alpaca-cleaned.
                    # 400 would be 26.2M, but the short mixture makes 23% of samples

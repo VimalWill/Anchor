@@ -1,6 +1,7 @@
 import os
 import shutil
 import random
+import re
 import itertools
 from tqdm import tqdm
 from functools import partial
@@ -8,7 +9,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import Dataset as HFDataset
 from datasets import load_dataset, load_from_disk
-import evaluate
 from huggingface_hub import hf_hub_download
 
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
@@ -132,6 +132,44 @@ def load_data(config):
             train_set, _ = _docs(n_val_rows, n_train)
         test_set = val_set
         cols = list(val_set.features)
+    elif "passkey" in data_name.lower():
+        # Passkey retrieval as the WHOLE corpus, train and validation both.
+        # This is the long-context arm: no LongAlpaca, no mixture ratio to
+        # justify, and eval/loss measures retrieval rather than prose
+        # modelling -- so metric_for_best_model actually tracks the thing being
+        # taught. The mixture version (passkey_mix_path) could not: passkey
+        # training RAISES LongAlpaca CE, so best_ckpt stuck at step 0.
+        #
+        # NOT packed. ConcatDataset would splice two haystacks into one window
+        # and leave a sequence with two answers and one question.
+        concat_data = False
+        if int(config.data.micro_batch_size) != 1:
+            raise ValueError('Unpacked passkey training requires micro_batch_size 1')
+        n_docs = int(config.data.get("num_train_docs", 10000))
+        n_val = int(config.data.get("num_val_docs", 200))
+        # Count BOS/EOS and the completion with the active tokenizer.
+        pk_max = min(input_len, int(config.data.get("passkey_max_tokens", input_len - 64)))
+        rows, skipped = collect_passkey_rows(
+            load_dataset(data_path, split="train", streaming=True), tokenizer,
+            n_docs + n_val, pk_max,
+            min_tokens=int(config.data.get('passkey_min_tokens', 0)),
+            min_distance=int(config.data.get('passkey_min_distance', 0)),
+            unique_answers=bool(config.data.get('passkey_unique_answers', False)))
+        if len(rows) < n_val + 1:
+            raise ValueError(f"{data_path}: only {len(rows)} examples under {pk_max} tokens")
+        random.Random(42).shuffle(rows)
+        # Stage 1 needs the CE anchor, stage 2 needs answer-only loss. See
+        # template_and_tokenize_passkey.
+        mask_prompt = bool(config.data.get("passkey_mask_prompt", True))
+        formatter = partial(template_and_tokenize_passkey, tokenizer=tokenizer,
+                            mask_prompt=mask_prompt)
+        print(f"-> passkey loss on {'answer span only' if mask_prompt else 'ALL tokens'}")
+        val_set = convert_to_hf_dataset(rows[:n_val], cache_dir)
+        train_set = convert_to_hf_dataset(rows[n_val:], cache_dir)
+        test_set = val_set
+        cols = list(val_set.features)
+        print(f"-> passkey corpus: {len(rows) - n_val} train / {n_val} val "
+              f"(<= {pk_max} actual tokens; rejected {skipped})")
     elif "wikitext" in data_name.lower():
         # WikiText rows are single LINES, not documents, so the pg19 branch is
         # wrong for it three ways: it shuffles rows (scrambling articles, which
@@ -223,6 +261,7 @@ def load_data(config):
     # Optional short-example mixture. Packed training gives the output gate only
     # sequences where the memory is written and informative; it never sees the
     # regime it has to shut off in. These stay UNPACKED at natural length.
+    mix_parts = []
     short_path = config.data.get('short_mix_path', None)
     if short_path:
         if int(config.data.micro_batch_size) != 1:
@@ -242,9 +281,43 @@ def load_data(config):
         short_set = convert_to_hf_dataset(rows, cache_dir).map(
             partial(template_and_tokenize_lm, tokenizer=tokenizer, include_label=True),
             remove_columns=['text'])
-        train_set = MixedDataset(train_set, short_set)
-        print(f'-> mixed in {len(short_set)} unpacked short examples from {short_path} '
-              f'({len(train_set)} training samples total)')
+        mix_parts.append(short_set)
+        print(f'-> mixed in {len(short_set)} unpacked short examples from {short_path}')
+
+    # Optional passkey-retrieval mixture. See template_and_tokenize_passkey:
+    # this is the only part of the corpus that requires storing an arbitrary
+    # token rather than its gist. Kept UNPACKED -- packing would splice two
+    # haystacks into one window and break the single-answer supervision.
+    pk_path = config.data.get('passkey_mix_path', None)
+    if pk_path:
+        if int(config.data.micro_batch_size) != 1:
+            raise ValueError('passkey_mix_path requires micro_batch_size 1')
+        n_pk = int(config.data.get('passkey_mix_docs', 10000))
+        # leave room for BOS/EOS and the tokeniser disagreeing with num_tokens
+        pk_max = int(config.data.get('passkey_max_tokens', input_len - 64))
+        rows, skipped = [], 0
+        for row in load_dataset(pk_path, split='train', streaming=True):
+            if row.get('num_tokens', 0) > pk_max:
+                skipped += 1
+                continue
+            rows.append({'prompt': row['prompt'], 'answer': row['answer'],
+                         'depth_percent': row.get('depth_percent', -1)})
+            if len(rows) >= n_pk:
+                break
+        if not rows:
+            raise ValueError(f'{pk_path}: no examples under {pk_max} tokens')
+        pk_set = convert_to_hf_dataset(rows, cache_dir).map(
+            # always answer-only here: the mixture arm's LongAlpaca half
+            # already supplies the CE anchor
+            partial(template_and_tokenize_passkey, tokenizer=tokenizer, mask_prompt=True),
+            remove_columns=['prompt', 'answer', 'depth_percent'])
+        mix_parts.append(pk_set)
+        print(f'-> mixed in {len(pk_set)} passkey examples from {pk_path} '
+              f'(<= {pk_max} tokens, skipped {skipped} longer)')
+
+    if mix_parts:
+        train_set = MixedDataset(train_set, *mix_parts)
+        print(f'-> {len(train_set)} training samples total')
 
     loader_kwargs = {
         "batch_size": config.data.micro_batch_size,
@@ -261,6 +334,7 @@ def load_data(config):
     }
     # Evaluation metric
     try:
+        import evaluate
         # metric = load_metric(download_metric(), 'gov_report')  # hack but we want rouge
         metric = evaluate.load(download_metric(), 'gov_report') 
     except Exception as e:
@@ -332,6 +406,91 @@ def template_and_tokenize_lm(sample, tokenizer, include_label: bool = True,
         "attention_mask": [1] * len(input_ids),
         "labels": list(input_ids),
     }
+
+
+PASSKEY_MARKER = "The pass key is "
+
+
+def passkey_parts(sample, tokenizer):
+    prefix, answer = sample["prompt"].rsplit(PASSKEY_MARKER, 1)
+    prefix += PASSKEY_MARKER
+    if answer.strip().rstrip('.') != str(sample["answer"]):
+        raise ValueError(f'passkey suffix {answer!r} != answer {sample["answer"]!r}')
+    prompt_ids = tokenizer.encode(prefix, add_special_tokens=True)
+    answer_ids = tokenizer.encode(answer, add_special_tokens=False)
+    if tokenizer.eos_token_id is not None:
+        answer_ids.append(tokenizer.eos_token_id)
+    return prefix, prompt_ids, answer_ids
+
+
+def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True,
+                                  mask_prompt: bool = True):
+    """Answer-only teacher forcing, or prompt-only generation inputs.
+
+    The dataset's prompt includes a supplied completion, which must be removed
+    for generation. Answer-only CE averages over supervised tokens; masking a
+    long prompt does not divide the answer loss by the total sequence length.
+    mask_prompt=False retains the existing all-token training option.
+    """
+    _, prompt_ids, answer_ids = passkey_parts(sample, tokenizer)
+    if include_label:
+        input_ids = prompt_ids + answer_ids
+        labels = ([-100] * len(prompt_ids) + answer_ids) if mask_prompt else list(input_ids)
+    else:
+        input_ids, labels = prompt_ids, answer_ids
+    return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids),
+            "labels": labels}
+
+
+def collect_passkey_rows(source, tokenizer, count, max_tokens, min_tokens=0,
+                         min_distance=0, unique_answers=False):
+    """Select intact examples using the active tokenizer, never truncation.
+
+    Distance is the separately tokenized suffix after the last numeric answer
+    occurrence in the prompt. Filtering removes a direct local-window shortcut;
+    it does not exclude information relay through stacked attention layers.
+    """
+    if count < 1 or not 0 <= min_tokens <= max_tokens or max_tokens < 1 or min_distance < 0:
+        raise ValueError('Invalid passkey count, token bounds, or distance')
+    rows, seen, answers = [], set(), set()
+    skipped = dict(invalid=0, too_long=0, too_short=0, too_close=0, duplicate=0)
+    for row in source:
+        try:
+            prefix, prompt_ids, answer_ids = passkey_parts(row, tokenizer)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # A malformed streaming row should not terminate an otherwise
+            # usable corpus. Keep formatter validation strict for direct use;
+            # count and skip bad records at the dataset boundary.
+            skipped['invalid'] += 1
+            continue
+        length = len(prompt_ids) + len(answer_ids)
+        if length > max_tokens:
+            skipped['too_long'] += 1
+            continue
+        if length < min_tokens:
+            skipped['too_short'] += 1
+            continue
+        if min_distance:
+            matches = list(re.finditer(r'(?<!\d)' + re.escape(str(row['answer']))
+                                       + r'(?!\d)', prefix))
+            if not matches:
+                skipped['invalid'] += 1
+                continue
+            distance = len(tokenizer.encode(prefix[matches[-1].end():],
+                                            add_special_tokens=False))
+            if distance < min_distance:
+                skipped['too_close'] += 1
+                continue
+        answer = str(row['answer'])
+        if row['prompt'] in seen or (unique_answers and answer in answers):
+            skipped['duplicate'] += 1
+            continue
+        seen.add(row['prompt'])
+        answers.add(answer)
+        rows.append({'prompt': row['prompt'], 'answer': row['answer']})
+        if len(rows) == count:
+            break
+    return rows, skipped
 
 
 def template_and_tokenize_longbench(sample, tokenizer, include_label: bool = True):

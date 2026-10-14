@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 import pandas as pd
 
 from tqdm import tqdm
@@ -77,7 +78,10 @@ class DefaultTrainer():
         self.compute_loss_backprop = False  # Whether we backprop in self.compute_loss
 
         self.optimizer, self.scheduler = optimizers
-        self.scheduler_step_after_epoch = True
+        # Plateau schedules consume validation metrics; step schedules advance
+        # only after a successful optimizer update, never on evaluation.
+        self.scheduler_step_after_epoch = isinstance(
+            self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
         # Dataloaders
         self.train_loader = train_loader
         self.eval_loader = eval_loader
@@ -226,13 +230,18 @@ class DefaultTrainer():
         num_batches = len(self.train_loader)
         pbar = tqdm(self.train_loader, leave=False, colour='blue', desc=f'-> Training (epoch {epoch} / {self.args.num_train_epochs})')
         total_loss = 0
+        successful_batches = 0
         eval_for_step = False
 
         # Initial eval
         if self.initial_eval:
             print('')
             print('-> Initial eval')
-            self.compute_eval_metrics(model, step=self.grad_step)
+            # Register and save the starting model too. Logging alone leaves
+            # best_val_metric at its sentinel, so the first trained checkpoint
+            # is called "best" even when it is worse than initialization.
+            self.eval_step(model, step=self.grad_step)
+            self.initial_eval = False
             # compute_eval_metrics sets model.eval() and does not restore it.
             # Without this the whole training loop runs in eval mode, which
             # disables the `self.gradient_checkpointing and self.training`
@@ -248,6 +257,7 @@ class DefaultTrainer():
                 accumulated_batches = 0
                 self.step += 1
                 continue
+            raw_loss = loss.detach().item()
             loss = loss / accum_iter
             if not self.compute_loss_backprop:
                 # loss.backward() did not occur in compute_loss
@@ -260,26 +270,25 @@ class DefaultTrainer():
                     self.step += 1
                     continue
             accumulated_batches += 1
+            optimizer_stepped = False
             if accumulated_batches == accum_iter or ix + 1 == num_batches:
-                self._optimizer_step(accumulated_batches, accum_iter)
+                optimizer_stepped = self._optimizer_step(accumulated_batches, accum_iter)
                 accumulated_batches = 0
-                if not self.compute_loss_backprop:
-                    loss = loss.detach().cpu().item()
             
             self.step += 1
-            if not isinstance(loss, float):
-                total_loss += loss.item()
-            else:
-                total_loss += loss
-            desc = f"Training epoch {epoch} | loss: {total_loss / (ix + 1):.3f} | lr: {self.optimizer.param_groups[0]['lr']:.5f}"
+            total_loss += raw_loss
+            successful_batches += 1
+            mean_loss = total_loss / successful_batches
+            desc = f"Training epoch {epoch} | loss_mean: {mean_loss:.3f} | loss_total: {raw_loss:.3f} | lr: {self.optimizer.param_groups[0]['lr']:.5f}"
             desc += f' | gradient step: {self.grad_step}'
             for k, v in train_metrics.items():
                 desc += f' | {k}: {v:.3f}'
             pbar.set_description(desc)
 
             # Logging
-            if (self.grad_step) % (self.logging_steps):
-                self.train_metrics['train/loss'] = loss.item() if not isinstance(loss, float) else loss
+            if optimizer_stepped and self.grad_step % self.logging_steps == 0:
+                self.train_metrics['train/loss'] = raw_loss
+                self.train_metrics['train/loss_mean'] = mean_loss
                 self.train_metrics['train/epoch'] = epoch
                 self.train_metrics['train/step'] = self.grad_step
                 self.train_metrics['train/lr'] = self.optimizer.param_groups[0]['lr']
@@ -318,6 +327,7 @@ class DefaultTrainer():
         """
         Evaluation loop over one epoch
         """
+        step = self.grad_step if step is None else step
         with torch.no_grad():
             self.eval_metrics = self.compute_eval_metrics(model, step=step, **kwargs)
             if self.metric_for_best_model not in self.eval_metrics:
@@ -326,6 +336,11 @@ class DefaultTrainer():
                     f'eval metrics {sorted(self.eval_metrics)}'
                 )
             val_metric = self.eval_metrics[self.metric_for_best_model]
+            if not math.isfinite(val_metric):
+                raise ValueError(
+                    f'Nonfinite checkpoint metric {self.metric_for_best_model}: '
+                    f'{val_metric} at step {step}'
+                )
 
             # Save results
             if self.wandb is not None:  # log to WandB
@@ -342,23 +357,21 @@ class DefaultTrainer():
                 pd.DataFrame(self.eval_metrics_by_step).to_csv(self.results_path)
 
             # Save best metric and checkpoint
-            if self.grad_step % self.eval_steps == 0 and step > 0:
-                if self.is_better(val_metric, self.best_val_metric):
-                    self.best_val_metric = val_metric
-                    self.best_val_metric_step = self.grad_step
-
-                    # overwrite one directory instead of accumulating an
-                    # iter_<step> dir per improvement: each is ~16GB and only
-                    # ~0.6% of it differs from the base checkpoint
-                    save_path = self.save_path + '/best_ckpt'
-                    self.best_val_checkpoint_path = save_path
-                    save_checkpoint(model, self.tokenizer, save_path)
-                    print(f'\n-> Saved best model checkpoint to: {save_path}!')
+            # Every evaluation is eligible, including step 0 and epoch-end
+            # evaluations that do not coincide with eval_steps.
+            if self.is_better(val_metric, self.best_val_metric):
+                # Reuse one directory: full checkpoints are large.
+                save_path = self.save_path + '/best_ckpt'
+                save_checkpoint(model, self.tokenizer, save_path)
+                self.best_val_checkpoint_path = save_path
+                self.best_val_metric = val_metric
+                self.best_val_metric_step = step
+                print(f'\n-> Saved best model checkpoint to: {save_path} '
+                      f'({self.metric_for_best_model}={val_metric:.6f}, step {step})!')
 
             if self.grad_step % self.save_steps == 0 and step > 0:
 
                 save_path = self.save_path + '/' + self.type + '_' + str(step)
-                self.best_val_checkpoint_path = save_path
                 save_checkpoint(model, self.tokenizer, save_path)
                 print(f'\n-> Saved model checkpoint to: {save_path}!')
             

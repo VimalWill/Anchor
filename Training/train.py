@@ -27,6 +27,7 @@ TTT_PARAM_KEYS = (
     'lr_proj', 'ttt_scale_proj', 'ttt_norm',
     'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj', 'retention_proj',
     'ttt_reader_alignment',
+    'ttt_feat_proj', 'ttt_feat_coef',
 )
 
 # yml `model:` keys consumed by the harness rather than by the model config
@@ -41,9 +42,16 @@ def build_model_config(config):
     32 kv heads, rope_theta 10000), which silently mismatch a Llama-3 checkpoint.
     """
     from LinearTTT.model.LinearizeLlama import LigerGLAConfig
-    model_config = LigerGLAConfig.from_pretrained(
-        config.model.pretrained_model_name_or_path
-    )
+    from LinearTTT.model.LinearizeMistral import LigerMistralGLAConfig
+    path = config.model.pretrained_model_name_or_path
+    source = AutoConfig.from_pretrained(path)
+    if source.model_type in ('mistral', 'liger_mistral_gla'):
+        config_class = LigerMistralGLAConfig
+    elif source.model_type in ('llama', 'liger_gla'):
+        config_class = LigerGLAConfig
+    else:
+        raise ValueError(f'Unsupported backbone: {source.model_type}')
+    model_config = config_class.from_pretrained(path)
     for k, v in config.model.items():
         if k in _HARNESS_ONLY:
             continue
@@ -84,6 +92,11 @@ def set_trainable_params(model, config):
             'lora_' in name
             or (train_ttt and any(k in name for k in TTT_PARAM_KEYS))
         )
+        if param.requires_grad and 'ttt_reader_alignment.weight' in name:
+            # Identity diagonals cannot accumulate AdamW steps of order 1e-4
+            # in BF16. ReaderOutputAlignment casts only for its forward matmul,
+            # so keep optimizer parameters/moments in FP32 in joint training too.
+            param.data = param.data.float()
     return model
 
 
@@ -99,10 +112,26 @@ def resume_stage2(model, adapter):
     return PeftModel.from_pretrained(model, adapter).merge_and_unload()
 
 
+def continue_stage2(model, adapter):
+    """Continue the existing adapter and TTT weights with a fresh optimizer.
+
+    Keeping the original adapter (rather than merging it and adding a new one)
+    makes the result reloadable against the SAME full/base checkpoint.
+    """
+    from eval import load_ttt_params
+    path = os.path.join(adapter, 'ttt_params.pt')
+    if not os.path.isfile(path):
+        raise ValueError(f'Anchor continuation requires saved TTT weights: {path}')
+    saved_count = len(torch.load(path, map_location='cpu', weights_only=True))
+    if load_ttt_params(model, adapter) != saved_count:
+        raise ValueError('Not all TTT weights matched the continuation model')
+    return PeftModel.from_pretrained(model, adapter, is_trainable=True)
+
+
 def train(config):
     from Training.dataloader import load_data
 
-    # stage: 'ttt_at' = attention transfer (per-layer distillation, no LM loss)
+    # stage: 'ttt_at' = attention transfer with an optional student LM loss
     #        'ttt_ar' = autoregressive finetune on the LM loss
     stage = config.model.name
     alignment_only = config.train.get('reader_alignment_only', False)
@@ -115,6 +144,8 @@ def train(config):
         raise NotImplementedError(stage)
 
     model_config = build_model_config(config)
+    if config.train.get('continue_adapter') and config.train.get('resume_adapter'):
+        raise ValueError('Choose continue_adapter or resume_adapter, not both')
     model = AutoModelForCausalLM.from_pretrained(
         config.model.pretrained_model_name_or_path,
         config=model_config,
@@ -123,6 +154,10 @@ def train(config):
 
     if config.train.get('resume_adapter'):
         model = resume_stage2(model, config.train.resume_adapter)
+    if config.train.get('continue_adapter'):
+        if stage != 'ttt_ar' or alignment_only:
+            raise ValueError('continue_adapter requires joint autoregressive training')
+        model = continue_stage2(model, config.train.continue_adapter)
 
 
     print("Model config:")
@@ -146,7 +181,7 @@ def train(config):
             target_modules.append("self_attn.v_proj")
         if "train_o" in config.train and config.train.train_o and config.train.train_o_lora:
             target_modules.append("self_attn.o_proj")
-    if len(target_modules) != 0:
+    if len(target_modules) != 0 and not isinstance(model, PeftModel):
         lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=target_modules)
         model = get_peft_model(model, peft_config=lora_config)
 
@@ -186,10 +221,8 @@ def train(config):
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=0,
             num_train_epochs=config.train.epochs,
-            # Without this the LR schedule is sized to a FULL epoch (~2.2k
-            # steps here) and every run we have killed at 400 stopped at 81%
-            # of peak LR, never annealed. max_steps overrides epochs and makes
-            # the linear decay match the budget actually spent.
+            # The custom optimizer builder uses this same budget when the
+            # config explicitly selects lr_scheduler: linear.
             max_steps=int(config.train.get('max_steps', -1)),
             learning_rate=float(config.train.lr),   # may arrive as str via oc.env
             bf16=True,

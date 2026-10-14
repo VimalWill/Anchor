@@ -281,6 +281,47 @@ class LinearTTTAttention(nn.Module):
         _active = getattr(config, 'ttt_layer_indices', None)
         self._ttt_enabled = _active is None or layer_idx in set(_active)
 
+        # Polynomial feature map (Based arXiv:2402.18668, ATLAS arXiv:2505.23735).
+        # phi(x) = [c0, c1*x, c2*(x kron x)] so phi(q).phi(k) = c0^2 + c1^2(q.k)
+        # + c2^2(q.k)^2 -- a learnable truncation of exp(q.k), since (q kron q).
+        # (k kron k) = (q.k)^2. Capacity for a matrix memory grows with the
+        # lifted dimension, but the point here is SEPARABILITY: keys are
+        # l2-normalised onto a sphere in R^128, and near-identical keys (FDA's
+        # repeated key-value pairs) blend in the readout. Lifting spreads them.
+        #
+        # Keys are projected to ttt_feature_dim FIRST, as Based does -- the full
+        # degree-2 lift of 128 dims is 8385-dimensional and would dominate the
+        # state. d'=32 gives 1057; d'=16 gives 273.
+        self.ttt_feature_map = getattr(config, 'ttt_feature_map', 'none')
+        _feat_layers = getattr(config, 'ttt_feature_layers', None)
+        self._lift = (self.ttt_feature_map == 'taylor2' and
+                      (_feat_layers is None or layer_idx in set(_feat_layers)))
+        d_feat = self.ttt_head_dim
+        if self._lift:
+            self.ttt_feature_dim = int(getattr(config, 'ttt_feature_dim', 32))
+            dp = self.ttt_feature_dim
+            # NO CONSTANT TERM. The Taylor form [1, x, x(x)x]/||c|| puts an
+            # IDENTICAL 1/sqrt(2.5)=0.632 in every key, so phi(k).phi(k') >= 0.4
+            # for every pair -- measured mean cosine 0.414 against 0.001 for the
+            # unlifted keys, with a MINIMUM of 0.210. An l2-regression memory
+            # fitted by gradient descent cannot separate keys that all overlap
+            # that much, and the first attempt diverged (MSE 218 vs 0.43, CE
+            # worse than uniform). Based tolerates the constant because its
+            # readout is an attention-like weighted sum where a shared component
+            # is a harmless bias; fitted by descent it is not. Dropping it gives
+            # mean cosine 0.023, close to the unlifted 0.001.
+            d_feat = dp + dp * dp
+            self.ttt_feat_proj = nn.Parameter(
+                torch.randn(self.num_ttt_heads, dp, self.ttt_head_dim)
+                / math.sqrt(self.ttt_head_dim))
+            # c_i, init sqrt(1/i!) so the kernel starts at 1 + (q.k) + (q.k)^2/2.
+            # c2 -> 0 recovers plain linear features, so the model can switch the
+            # lift off and the learned value is the diagnostic.
+            self.ttt_feat_coef = nn.Parameter(
+                torch.tensor([1.0, 1.0 / math.sqrt(2.0)]).repeat(
+                    self.num_ttt_heads, 1))
+        d_in = d_feat
+
         if self._ttt_enabled:
             self.w0 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
             self.w1 = nn.Parameter(torch.randn(self.num_ttt_heads, d_out, d_h) / math.sqrt(d_h) * gain)
@@ -317,6 +358,9 @@ class LinearTTTAttention(nn.Module):
             # NON-monotonic near zero, so gamma=0 is reachable only through a
             # -0.2785 detour -- the branch cannot cleanly learn to shut off.
             self.ttt_gate = getattr(config, 'ttt_gate', 'silu')
+            # Probability of zeroing the SWA branch for a sequence during
+            # training. Recipe-only: nothing about the deployed model changes.
+            self.ttt_swa_dropout = float(getattr(config, 'ttt_swa_dropout', 0.0))
             # Below lact_chunk_size the operator's loop never executes, so the
             # readout is a fixed function of q with zero context in it; zeroing
             # it there discards nothing. Prefill only -- after a prefill that
@@ -379,7 +423,11 @@ class LinearTTTAttention(nn.Module):
         """
         if not self._ttt_enabled:
             return
-        d_in, d_h = self.ttt_head_dim, self.w0.shape[1]
+        # From the TENSOR, not ttt_head_dim: under a polynomial feature map the
+        # lifted input is 1 + d' + d'^2 wide, and hardcoding 128 would re-init
+        # w0/w2 with a std sqrt(1057/128) = 2.87x too large, silently undoing
+        # the constructor.
+        d_in, d_h = self.w0.shape[2], self.w0.shape[1]
         # A non-leader's w0/w1/w2 alias its leader's, and follower keys come
         # back missing from a shared checkpoint so _init_weights runs on them.
         # Without this guard it overwrites the leader's loaded values.
@@ -394,6 +442,14 @@ class LinearTTTAttention(nn.Module):
             # No counterpart in the Llama checkpoint, and _init_weights handles
             # Linear/Embedding only -- uninitialised under the meta-device path.
             self.ttt_norm.weight.fill_(1.0)
+            # Also absent from the Llama checkpoint and not an nn.Linear, so
+            # uninitialised under the meta-device path.
+            if self._lift:
+                self.ttt_feat_proj.normal_(0, 1 / math.sqrt(self.ttt_head_dim))
+                self.ttt_feat_coef.copy_(
+                    torch.tensor([1.0, 1.0 / math.sqrt(2.0)],
+                                 device=self.ttt_feat_coef.device)
+                    .repeat(self.num_ttt_heads, 1))
         # Nearly closed so the host's residual stream survives step 0, but not
         # fully: silu(0) == 0 would cut the gradient to lr_proj and the weights.
         nn.init.zeros_(self.ttt_scale_proj.weight)
@@ -428,7 +484,33 @@ class LinearTTTAttention(nn.Module):
             # heads, so one inner lr cannot serve them all. Output magnitude is
             # set downstream by ttt_norm + ttt_scale_proj anyway.
             v = l2_norm(v)
-        return l2_norm(q), l2_norm(k), v
+        q, k = l2_norm(q), l2_norm(k)
+        if self._lift:
+            # v is NOT lifted: the memory still regresses onto the value space.
+            q, k = self._taylor2(q), self._taylor2(k)
+        return q, k, v
+
+    def _taylor2(self, x):
+        """[(b h), n, d_head] -> [(b h), n, d' + d'^2].
+
+        x arrives l2-normalised, which is load-bearing: on the unit sphere
+        (q.k) is in [-1, 1] and the truncated series tracks exp(q.k). Off it the
+        quadratic term dominates and the map stops approximating anything.
+        """
+        h = self.num_ttt_heads
+        bh, n, _ = x.shape
+        xh = x.view(bh // h, h, n, -1)
+        xp = l2_norm(torch.einsum('bhnd,hpd->bhnp', xh, self.ttt_feat_proj))
+        c = self.ttt_feat_coef                                    # [h, 2]
+        quad = torch.einsum('bhnp,bhnq->bhnpq', xp, xp).flatten(-2)
+        phi = torch.cat([c[:, 0, None, None] * xp,
+                         c[:, 1, None, None] * quad], dim=-1)
+        # ||phi||^2 = c1^2 + c2^2 exactly, since ||x||=||x kron x||=1. Dividing
+        # by that CONSTANT keeps unit-norm features as c is learned, so
+        # ttt_base_lr stays calibrated. Per-sample normalisation would instead
+        # rescale the blocks unevenly and destroy the kernel's shape.
+        phi = phi / c.pow(2).sum(-1).sqrt()[:, None, None]
+        return phi.reshape(bh, n, -1)
 
     def _decode_step(self, hidden_states, position_ids, position_embeddings,
                      past_key_value, bsz, q_len):
@@ -826,6 +908,26 @@ class LinearTTTAttention(nn.Module):
 
         if self._ablate_attn:
             attn_out = torch.zeros_like(attn_out)
+        elif self.training and self.ttt_swa_dropout > 0:
+            # Force the memory to carry the whole teacher signal on a fraction
+            # of sequences, so it sees gradient beyond the weak residual past
+            # window_size. Dropped per SEQUENCE, so some batches stay in the
+            # deployment regime; inference is untouched (self.training is
+            # False), so the deployed model and its state size are unchanged.
+            #
+            # OFF BY DEFAULT, and the obvious motivation for it does not hold
+            # here. Lizard (arXiv 2507.09025) reports "Local Attention
+            # Dominance" -- a wide window starving the recurrent module, MMLU
+            # 61.2 -> 44.6 going w=128 -> 256. This model does not show it: a
+            # trained SWA-512-only arm scores 29.60 recall average against the
+            # anchor's 42.24 (SWDE 27.72 -> 50.50), so the memory is already
+            # carrying load at window 512, and the same sweep found 512 -> 128
+            # free on commonsense (72.38 vs 72.35). Kept as an ablation knob,
+            # not as a fix: the measured deficit is that the memory stores gist
+            # and not token identity, which no amount of dropout teaches.
+            keep = (torch.rand(bsz, device=attn_out.device)
+                    >= self.ttt_swa_dropout).to(attn_out.dtype)
+            attn_out = attn_out * keep[:, None, None]
         # The inner loop runs only for q_len > lact_chunk_size, so below that the
         # memory was never written and the readout carries no context at all.
         if self.ttt_idle_zero and ttt_out.shape[1] <= self.lact_chunk_size:
