@@ -5,6 +5,9 @@ import json
 import math
 import os
 import re
+import random
+
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +17,9 @@ from omegaconf import OmegaConf
 import LinearTTT  # noqa: F401
 from Training.train import build_model_config
 from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
+from LinearTTT.model.LinearizeMistral.LinearizeMistral import (
+    use_sdpa_sliding_window as use_mistral_sdpa_sliding_window,
+)
 
 _PEFT_PREFIX = re.compile(r'^base_model\.model\.')
 
@@ -34,6 +40,12 @@ def load_ttt_params(model, adapter, verbose=True):
         return 0
     sd = torch.load(ttt, map_location='cpu')
     sd = {_PEFT_PREFIX.sub('', k): v for k, v in sd.items()}
+    # Training accumulates small reader updates in FP32. The base model was
+    # cast to BF16 before this overlay; promote BEFORE copying saved values,
+    # otherwise continuation irreversibly rounds away those updates.
+    for name, param in model.named_parameters():
+        if name.endswith('ttt_reader_alignment.weight') and name in sd:
+            param.data = param.data.to(dtype=sd[name].dtype)
     unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
     matched = len(sd) - len(unexpected)
     if matched == 0:
@@ -419,10 +431,36 @@ SUITES = {
 }
 
 
-def resolve(tasks):
-    """Check task names against the installed registry before spending a load."""
+def ruler_task_specs(tasks, lengths):
+    """Register custom NIAH lengths as metrics as well as dataset metadata.
+
+    Upstream NIAH YAMLs only register 4k through 128k. Requesting 2k data
+    without its aggregation can fail when the harness computes the scores.
+    Keep the standard lengths too: process_results can emit sentinel entries
+    for them, and the upstream aggregator discards those sentinel values.
+    """
+    if not lengths or not any(t.startswith('niah_') for t in tasks):
+        return list(tasks)
+    from lm_eval.tasks.ruler import common_utils
+    metric_lengths = sorted(set(lengths) | {4096, 8192, 16384, 32768, 65536, 131072}
+                            | set(getattr(common_utils, 'DEFAULT_SEQ_LENGTHS', [])))
+    return [dict(task=t, metric_list=[
+                dict(metric=str(length), aggregation=common_utils.aggregate_metrics,
+                     higher_is_better=True) for length in metric_lengths])
+            if t.startswith('niah_') else t for t in tasks]
+
+
+def resolve(tasks, metadata=None):
+    """Check task names against the installed registry before spending a load.
+
+    `metadata` must reach the TaskManager, not simple_evaluate: RULER builds its
+    haystacks inside ConfigurableTask.__init__, which runs during
+    task_manager.load_task_or_group(), long before simple_evaluate looks at its
+    own metadata argument. Passing it only downstream leaves get_tokenizer()
+    with nothing and it asserts.
+    """
     from lm_eval.tasks import TaskManager
-    tm = TaskManager()
+    tm = TaskManager(metadata=metadata) if metadata else TaskManager()
     have = set(getattr(tm, 'all_tasks', None) or tm.task_index.keys())
     missing = [t for t in tasks if t not in have]
     if missing:
@@ -457,11 +495,26 @@ def main():
     ap.add_argument('--limit', type=int, default=None,
                     help='cap examples per task -- required for a layer sweep')
     ap.add_argument('--num-fewshot', type=int, default=None)
+    ap.add_argument('--seed', type=int, default=0,
+                    help='seed task construction and inference for paired evaluations')
     ap.add_argument('--batch-size', default='4')
     ap.add_argument('--ablate', choices=['ttt', 'attn'], default=None)
     ap.add_argument('--layers', type=int, nargs='+', default=None,
                     help='layers to ablate; omit with --ablate for whole-branch')
     ap.add_argument('--out', default='eval')
+    ap.add_argument('--window', type=int, default=None,
+                    help='override window_size. The model requires window_size >= '
+                         'lact_chunk_size, because apply-then-update means tokens '
+                         'in the CURRENT chunk are not in the memory yet and '
+                         'attention must cover them -- a smaller window leaves a '
+                         'blind spot. So shrinking the window normally means '
+                         'passing --chunk to match.')
+    ap.add_argument('--ruler-lengths', type=int, nargs='+', default=None,
+                    help='RULER context lengths, passed as metadata.max_seq_lengths. '
+                         'lm_eval otherwise defaults to a ladder reaching 32k-128k, '
+                         'far past the 8192 these models were trained at, which '
+                         'measures extrapolation and takes hours. --seq-len must '
+                         'leave room for the longest one plus generation.')
     ap.add_argument('--keep-frac', type=float, default=None,
                     help='CAPACITY SWEEP: keep this fraction of each memory\'s d_h '
                          'SwiGLU hidden channels and zero the rest. Verified '
@@ -515,6 +568,9 @@ def main():
                          'never the group. Only with every member off is the '
                          "group's contribution to the residual stream zero.")
     args = ap.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Fail before a multi-minute checkpoint load, not after.
     if args.baseline:
@@ -522,6 +578,13 @@ def main():
             raise SystemExit('--baseline has no TTT branch to sweep; drop --retrieval')
         if args.ablate or args.identity_readers:
             raise SystemExit('--baseline has no TTT branch to ablate')
+        if args.keep_frac is not None:
+            raise SystemExit('--baseline has no fast weights to shrink; drop --keep-frac')
+        if args.window or args.chunk:
+            raise SystemExit(
+                '--baseline is full attention with no sliding window or chunked '
+                'memory, so --window/--chunk would be silently ignored and the '
+                'output would be mislabelled. Drop them.')
     elif not args.ckpt:
         raise SystemExit('--ckpt is required unless --baseline is given')
 
@@ -533,7 +596,11 @@ def main():
     tasks, tm = None, None
     if not args.retrieval:
         tasks = args.tasks or [t for s in args.suite for t in SUITES[s]]
-        tm = resolve(tasks)
+        meta = None
+        if args.ruler_lengths:
+            meta = {'max_seq_lengths': args.ruler_lengths,
+                    'pretrained': args.base, 'tokenizer': args.base}
+        tm = resolve(tasks, meta)
 
     # lm-eval sends a different sequence length for nearly every request, while
     # sliding_window_attention compiles flex_attention with dynamic=False. Past
@@ -557,17 +624,28 @@ def main():
             args.base, device_map={'': 0}, torch_dtype=torch.bfloat16).eval()
         model_config, mods, sel, causality = model.config, [], [], None
     else:
+        # --ckpt supersedes the training initialization, including a required
+        # TTT_INIT environment interpolation in a continuation config.
+        config.model.pretrained_model_name_or_path = args.ckpt
         cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
-        cfg.model.pretrained_model_name_or_path = args.ckpt
-        if args.chunk:
-            win = int(cfg.model.get('window_size', cfg.model.lact_chunk_size))
-            if args.chunk > win:
+        if args.window or args.chunk:
+            old_w = int(cfg.model.get('window_size', cfg.model.lact_chunk_size))
+            old_c = int(cfg.model.lact_chunk_size)
+            new_w = args.window or old_w
+            new_c = args.chunk or old_c
+            if new_c > new_w:
                 raise SystemExit(
-                    f'--chunk {args.chunk} exceeds window_size {win}; the model '
-                    'requires window_size >= lact_chunk_size')
-            print(f'chunk override: {cfg.model.lact_chunk_size} -> {args.chunk} '
-                  f'(window {win} unchanged, so the attention path is identical)')
-            cfg.model.lact_chunk_size = args.chunk
+                    f'lact_chunk_size {new_c} exceeds window_size {new_w}. '
+                    'Apply-then-update leaves the current chunk out of the memory, '
+                    'so attention must cover it; pass --chunk to match --window.')
+            if new_w != old_w:
+                print(f'window override: {old_w} -> {new_w}')
+            if new_c != old_c:
+                print(f'chunk override: {old_c} -> {new_c}'
+                      + ('' if new_w != old_w else
+                         f' (window {new_w} unchanged, attention path identical)'))
+            cfg.model.window_size = new_w
+            cfg.model.lact_chunk_size = new_c
         model_config = build_model_config(cfg)
         model = load_model(args.ckpt, model_config, args.adapter)
         mods = ttt_layers(model)
@@ -590,6 +668,7 @@ def main():
     for prm in model.parameters():
         prm.requires_grad_(False)
     use_sdpa_sliding_window(True)
+    use_mistral_sdpa_sliding_window(True)
 
     causality = None
     if getattr(model.config, 'ttt_share_groups', None):
@@ -619,7 +698,30 @@ def main():
     lm = HFLM(pretrained=model, tokenizer=args.base,
               batch_size=args.batch_size, max_length=eval_len)
 
-    kwargs = dict(model=lm, tasks=tasks, task_manager=tm, limit=args.limit)
+    kwargs = dict(model=lm, tasks=ruler_task_specs(tasks, args.ruler_lengths),
+                  task_manager=tm, limit=args.limit,
+                  random_seed=args.seed, numpy_random_seed=args.seed,
+                  torch_random_seed=args.seed, fewshot_random_seed=args.seed)
+    if args.ruler_lengths:
+        import inspect
+        if 'metadata' not in inspect.signature(lm_eval.simple_evaluate).parameters:
+            raise SystemExit('this lm_eval has no simple_evaluate(metadata=...); '
+                             'set max_seq_lengths in the task YAML instead')
+        # RULER builds its haystacks by tokenising to the target length, and
+        # reads the tokenizer from metadata.pretrained. lm_eval normally fills
+        # that from --model_args, but we hand simple_evaluate an already-built
+        # model object, so it never sees a name and get_tokenizer() asserts.
+        kwargs['metadata'] = {'max_seq_lengths': args.ruler_lengths,
+                              'pretrained': args.base, 'tokenizer': args.base}
+        # also on the TaskManager above -- that is the one RULER actually reads
+        print(f'RULER context lengths: {args.ruler_lengths} '
+              f'(tokenizer {args.base})')
+        longest = max(args.ruler_lengths)
+        if eval_len < longest + 256:
+            raise SystemExit(
+                f'--seq-len {eval_len} leaves no room for a {longest}-token RULER '
+                f'context plus generation; the needle would be truncated away. '
+                f'Use --seq-len {longest + 512} or more.')
     if args.log_samples:
         kwargs['log_samples'] = True
     if args.num_fewshot is not None:
@@ -652,6 +754,11 @@ def main():
                    'limit': args.limit, 'ablate': args.ablate,
                    'layers': args.layers, 'causality': causality,
                    'identity_readers': args.identity_readers,
+                   'seed': args.seed, 'ruler_lengths': args.ruler_lengths,
+                   'tokenizer': args.base, 'eval_context_length': eval_len,
+                   'window_size': getattr(model_config, 'window_size', None),
+                   'ttt_layer_indices': getattr(model_config, 'ttt_layer_indices', None),
+                   'ttt_share_groups': getattr(model_config, 'ttt_share_groups', None),
                    'results': flat}, f, indent=2)
     print(f'\nwrote {path}')
 
