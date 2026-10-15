@@ -1,0 +1,33 @@
+diff --git a/training/train.py b/training/train.py
+index f8f0367..5ed132e 100644
+--- a/training/train.py
++++ b/training/train.py
+@@ -7,7 +7,10 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+ import fla
+-import liger
++try:
++    import liger
++except ImportError:  # the GLA variants need a transformers that still exports
++    liger = None     # LossKwargs; lolcats does not import them at all
+ import lolcats
+ import torch.utils
+ import torch.utils.data
+@@ -42,12 +45,14 @@ def train(config):
+     elif config.model.name == "lolcats_at":
+         # first stage: attention transfer
+         from lolcats.models.lolcats import LolcatsConfig
+-        liger_model_config = LolcatsConfig()
++        # Bare LolcatsConfig() is Llama-2 shaped and silently overrides the
++        # checkpoint's own config.json, which is passed as config= below.
++        liger_model_config = LolcatsConfig.from_pretrained(config.model.pretrained_model_name_or_path)
+         trainer = DefaultTrainer
+     elif config.model.name == "lolcats_ar":
+         # second stage
+         from lolcats.models.lolcats import LolcatsConfig
+-        liger_model_config = LolcatsConfig()
++        liger_model_config = LolcatsConfig.from_pretrained(config.model.pretrained_model_name_or_path)
+     else:
+         raise NotImplementedError(config.model.name)
+     
