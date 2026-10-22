@@ -20,12 +20,15 @@ class TTTHybridBlock(TTTBlock):
         self.attention.out_proj = self.out
         self.collect_distillation = False
         self.distillation_loss = None
+        # False leaves only the SWA branch: how ANCHOR deploys an ANCHOR-I
+        # model, by dropping the interior memories without retraining.
+        self.memory_enabled = True
 
     def forward(self, x, **_):
         self.distillation_loss = None
         projected = self.qkv(x).chunk(3, dim=-1)
         local = self.attention.attention_output(projected)
-        combined = local + self._memory_output(x, projected)
+        combined = local + self._memory_output(x, projected) if self.memory_enabled else local
         if self.collect_distillation:
             # Stage-1 teacher: full causal attention on the same hidden states
             # and frozen projections, matching the deployed attention transfer.

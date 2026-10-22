@@ -19,18 +19,10 @@ from Training.trainer import DefaultTrainer, FinetuneTrainer
 from Training.utils import get_optimizer_and_scheduler, count_model_params
 
 
-# Datasets whose runs continue from a trained stage-2 checkpoint. They need
-# the trainable parameters promoted to FP32 before the BF16 overlay, an
-# explicit window backend, and a fresh output directory. Keying these on the
-# literal 'long_context' silently skipped all three for any new dataset.
-# The answer-only loss check in trainer.py is deliberately NOT keyed on this:
-# it requires one contiguous supervised suffix, and reactive_passkey
-# supervises every assistant turn.
+# Stage-2 continuations: need FP32 trainables, an explicit window backend, a fresh output dir.
 CONTINUATION_DATASETS = ('long_context', 'reactive_passkey', 'synthetic_niah')
 
-# Parameters belonging to the test-time-training branch. These have no
-# counterpart in the pretrained checkpoint, so unlike the Liger recipe they must
-# actually be trained -- LoRA on q/k/v alone leaves them at their random init.
+# TTT-branch params: absent from the pretrained checkpoint, so they must be trained directly.
 TTT_PARAM_KEYS = (
     '.w0', '.w1', '.w2',
     'lr_proj', 'ttt_scale_proj', 'ttt_norm',
@@ -45,11 +37,7 @@ _HARNESS_ONLY = {'name', 'pretrained_model_name_or_path', 'device_map',
 
 
 def build_model_config(config):
-    """Load the checkpoint's own shape, then apply the yml `model:` overrides.
-
-    Constructing LigerGLAConfig() bare gives Llama-2 defaults (vocab 32000,
-    32 kv heads, rope_theta 10000), which silently mismatch a Llama-3 checkpoint.
-    """
+    """Load the checkpoint's own shape, then apply the yml `model:` overrides."""
     from LinearTTT.model.LinearizeLlama import LigerGLAConfig
     from LinearTTT.model.LinearizeMistral import LigerMistralGLAConfig
     path = config.model.pretrained_model_name_or_path
@@ -64,9 +52,7 @@ def build_model_config(config):
     for k, v in config.model.items():
         if k in _HARNESS_ONLY:
             continue
-        # PretrainedConfig cannot JSON-serialise ListConfig/DictConfig, so
-        # list-valued keys (ttt_share_groups, ttt_inter_multi) would break both
-        # __repr__ and save_pretrained. Convert to plain containers.
+        # PretrainedConfig cannot JSON-serialise OmegaConf containers.
         if OmegaConf.is_config(v):
             v = OmegaConf.to_object(v)
         # checkpoints carry the `attn_varient` misspelling
@@ -79,15 +65,13 @@ def build_model_config(config):
 
 
 def set_trainable_params(model, config):
-    """Decide the trainable set. Must run *after* get_peft_model, which marks
-    every non-adapter parameter frozen."""
+    """Decide the trainable set; must run after get_peft_model, which freezes non-adapters."""
     if config.train.get('reader_alignment_only', False):
         count = 0
         for name, param in model.named_parameters():
             param.requires_grad = 'ttt_reader_alignment.weight' in name
             if param.requires_grad:
-                # FP32 optimizer parameters preserve small steps near I even
-                # when the model/readout matmul uses BF16.
+                # FP32 so small steps near identity are not rounded away in BF16.
                 param.data = param.data.float()
                 count += param.numel()
         if not count:
@@ -103,11 +87,7 @@ def set_trainable_params(model, config):
             or (train_ttt and any(k in name for k in TTT_PARAM_KEYS))
         )
         if param.requires_grad and (long_context or 'ttt_reader_alignment.weight' in name):
-            # Identity diagonals cannot accumulate AdamW steps of order 1e-4
-            # in BF16. ReaderOutputAlignment casts only for its forward matmul,
-            # so keep optimizer parameters/moments in FP32 in joint training too.
-            # Long-context training also needs FP32 gates, retention, norms,
-            # and initial memories: BF16 can round each small outer update away.
+            # FP32 master weights: BF16 rounds away small AdamW updates.
             param.data = param.data.float()
     return model
 
@@ -125,11 +105,7 @@ def resume_stage2(model, adapter):
 
 
 def continue_stage2(model, adapter):
-    """Continue the existing adapter and TTT weights with a fresh optimizer.
-
-    Keeping the original adapter (rather than merging it and adding a new one)
-    makes the result reloadable against the SAME full/base checkpoint.
-    """
+    """Continue the existing adapter and TTT weights with a fresh optimizer."""
     from eval import load_ttt_params
     path = os.path.join(adapter, 'ttt_params.pt')
     if not os.path.isfile(path):
@@ -166,8 +142,7 @@ def train(config):
     ).to(torch.bfloat16)
 
     if config.data.get('name') in CONTINUATION_DATASETS:
-        # Promote before the overlay so continuation does not round the saved
-        # FP32 TTT parameters through BF16 on their way into the optimizer.
+        # Promote to FP32 before loading saved TTT weights so they skip a BF16 round-trip.
         set_trainable_params(model, config)
         backend = config.train.get('window_backend', 'sdpa')
         if backend not in ('sdpa', 'flex'):
@@ -195,9 +170,7 @@ def train(config):
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"  # Allow batched inference
 
-    # LoRA finetune. Attention transfer trains only the TTT branch: the
-    # pretrained projections have to stay exactly as the teacher sees them, or
-    # the regression target moves with the student.
+    # No LoRA for attention transfer: projections must match the teacher's exactly.
     target_modules = []
     if stage != 'ttt_at' and not alignment_only:
         if "train_qk" in config.train and config.train.train_qk and config.train.train_qk_lora:
@@ -216,16 +189,12 @@ def train(config):
         os.makedirs(config.train.output_dir, exist_ok=True)
         OmegaConf.save(config, os.path.join(config.train.output_dir, 'study_config.yaml'), resolve=True)
 
-    # Without this every one of the 32 layers keeps its activations for backward.
-    # At 8192 tokens that alone is ~40GB, on top of 16GB of weights and the
-    # retained (student, teacher) pairs. Costs ~30% compute, saves ~10x memory.
     if config.train.get('gradient_checkpointing', True):
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={'use_reentrant': False}
         )
         print('Gradient checkpointing: enabled')
 
-    # print trainable params count
     trainable_params = count_model_params(model, requires_grad=True)
     total_params = count_model_params(model, requires_grad=False)
     print(f"Model trainable params: {trainable_params}")
@@ -247,8 +216,7 @@ def train(config):
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=int(config.train.get('warmup_steps', 0)),
             num_train_epochs=config.train.epochs,
-            # The custom optimizer builder uses this same budget when the
-            # config explicitly selects lr_scheduler: linear.
+            # Also the budget for lr_scheduler: linear.
             max_steps=int(config.train.get('max_steps', -1)),
             learning_rate=float(config.train.lr),   # may arrive as str via oc.env
             bf16=True,
@@ -263,13 +231,10 @@ def train(config):
             output_dir=config.train.output_dir,
             save_total_limit=3,
             load_best_model_at_end=True if config.data.val_set_size > 0 else False,
-            # default trainer args
             greater_is_better = bool(config.train.get('greater_is_better', False)),
-            # stage 1's composite loss is MSE-dominated early, so selecting on
-            # it picks checkpoints with bad perplexity; select on CE instead
+            # Select on CE, not stage 1's MSE-dominated composite loss.
             metric_for_best_model = config.train.get('metric_for_best_model', 'eval/loss'),
-            # wandb
-            report_to="none" # wandb off "wandb"
+            report_to="none"
         )
     
     trainer = trainer(

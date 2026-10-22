@@ -13,7 +13,3 @@ tqdm
 lm_eval
 pandas
 matplotlib
-
-# PyTorch is intentionally not pinned here since the right wheel depends on
-# your CUDA version. Install separately, e.g.:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
