@@ -29,7 +29,6 @@ from transformers.models.llama.modeling_llama import (
 from transformers.utils import logging, add_start_docstrings_to_model_forward
 from transformers.utils import is_flash_attn_2_available
 
-# packages to integrate test-time training
 from .ttt_ops import (
     block_causal_lact_swiglu,
     prenorm_block_causal_lact_swiglu,
@@ -50,8 +49,7 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 logger = logging.get_logger(__name__)
 
-# Must be compiled: called bare, flex_attention falls back to `math_attention`,
-# which materialises the whole [B, H, Q, KV] score matrix and masks afterwards.
+# Must be compiled; eager flex_attention materialises the dense [B, H, Q, KV] scores.
 _flex_attention_compiled = None
 
 
@@ -62,8 +60,7 @@ def _compiled_flex_attention():
     return _flex_attention_compiled
 
 
-# Fallback for varying sequence lengths (lm-eval), where dynamo stops lowering
-# the call and flex drops to a dense [B, H, Q, KV]. Peak B*H*C*(C+W).
+# Fallback for varying sequence lengths, where flex drops to a dense [B, H, Q, KV].
 _force_sdpa_window = False
 
 
@@ -74,11 +71,7 @@ def use_sdpa_sliding_window(enable: bool = True):
 
 
 def _sdpa_sliding_window(q, k, v, window_size, causal, scale, chunk=1024):
-    """Chunked softmax attention over a sliding window. [B, H, T, D] in and out.
-
-    matmul + softmax rather than SDPA, whose GQA validation rejects these
-    slices. Peak is B*H*C*(C+W).
-    """
+    """Chunked softmax attention over a sliding window. [B, H, T, D] in and out."""
     B, H, T, D = q.shape
     if k.shape[1] != H:                    # GQA: broadcast kv heads up to q heads
         k = repeat_kv(k, H // k.shape[1])
@@ -118,19 +111,21 @@ def sliding_window_attention(
     KV_len = k.shape[2]
     device = q.device
 
-    # Non-square (decode with rolling KV buffer): all KV tokens are already
-    # causally valid and within the window (trimmed before calling), so no mask needed.
+    # Decode: KV is pre-trimmed to the causal window, so no mask is needed.
     if Q_len != KV_len:
         return _compiled_flex_attention()(q, k, v, scale=scale)
 
-    # apply_rotary_pos_emb BROADCASTS: under generate() q/k can expand to the
-    # prefix length while v does not, and Q_len == KV_len still passes.
+    # rotary embedding can broadcast q/k to the prefix length while v is not.
     if v.shape[2] != KV_len:
         raise RuntimeError(
             f'v has {v.shape[2]} positions but k has {KV_len}: q/k were '
             'broadcast by the rotary embedding while v was not. This model has '
             'no incremental-decode path -- run generation with use_cache=False.'
         )
+
+    # Q_len <= window_size: plain causal SDPA is exact; avoids per-length flex recompiles.
+    if Q_len <= window_size:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
 
     if _force_sdpa_window or q.device.type != 'cuda':
         return _sdpa_sliding_window(q, k, v, window_size, causal, scale)
@@ -148,8 +143,7 @@ def sliding_window_attention(
     if block_mask_cache is not None and cache_key in block_mask_cache:
         block_mask = block_mask_cache[cache_key]
     else:
-        # B=H=None keeps the mask [1, 1, Q, Q]; passing them materialises the
-        # dense per-head mask, 256 GiB at 32k.
+        # B=H=None keeps the mask [1, 1, Q, Q]; passing them materialises a dense mask.
         try:
             block_mask = create_block_mask(
                 mask_mod, None, None, Q_len, Q_len, device=device, _compile=True)
@@ -163,11 +157,7 @@ def sliding_window_attention(
     return output
 
 class ReaderOutputAlignment(nn.Module):
-    """Head-wise A_h y_h, initialized to I; unconstrained, not a rotation.
-
-    Kept as a separate module so missing weights in an older checkpoint are
-    explicitly identity-initialized by the Hugging Face loading path.
-    """
+    """Head-wise A_h y_h, initialized to I; unconstrained, not a rotation."""
     def __init__(self, heads, dim):
         super().__init__()
         self.weight = nn.Parameter(torch.eye(dim).repeat(heads, 1, 1))
@@ -228,7 +218,7 @@ class LinearTTTAttention(nn.Module):
             )
 
         self.lact_chunk_size = getattr(config, 'lact_chunk_size', 512)
-        self.window_size = getattr(config, 'window_size', self.lact_chunk_size)
+        self.window_size = config.window_size_for_layer(layer_idx)
         if self.window_size < self.lact_chunk_size:
             raise ValueError(
                 f'window_size ({self.window_size}) must be >= lact_chunk_size ({self.lact_chunk_size}); '
@@ -238,8 +228,7 @@ class LinearTTTAttention(nn.Module):
         self.ttt_use_momentum = getattr(config, 'ttt_use_momentum', True)
         self.ttt_prenorm = getattr(config, 'ttt_prenorm', False)
 
-        # 'dot' = LaCT Eq. 7 + Eq. 8 renorm; 'l2' = Atlas Eq. 9 + Eq. 32
-        # retention gate. The pairings are not interchangeable -- see ttt_l2.py.
+        # 'dot': LaCT Eq. 7 + Eq. 8 renorm; 'l2': Atlas Eq. 9 + Eq. 32 retention gate.
         self.ttt_inner_loss = getattr(config, 'ttt_inner_loss', 'dot')
         if self.ttt_inner_loss not in ('dot', 'l2'):
             raise ValueError(
@@ -250,8 +239,7 @@ class LinearTTTAttention(nn.Module):
                 "ttt_inner_loss='l2' has no prenorm variant; set ttt_prenorm=False."
             )
 
-        # State is proportional to ttt_inter_multi -- the knob for allocating
-        # capacity across layers. Scalar (uniform) or a per-layer list.
+        # Scalar or per-layer list; state size is proportional to it.
         inter = getattr(config, 'ttt_inter_multi', 1.0)
         if isinstance(inter, (list, tuple)):
             if layer_idx is None:
@@ -273,25 +261,11 @@ class LinearTTTAttention(nn.Module):
             )
         gain = getattr(config, 'fw_init_gain', 0.5)
 
-        # Layers outside ttt_layer_indices keep the sliding-window branch and
-        # the pretrained block but carry NO test-time memory: no fast weights,
-        # no inner loop, no per-sequence state. Handled here rather than with a
-        # separate layer class, because a class built on LlamaDecoderLayer
-        # inherits FULL softmax attention and silently de-linearises the model.
+        # Layers outside ttt_layer_indices keep SWA but have no fast-weight memory.
         _active = getattr(config, 'ttt_layer_indices', None)
         self._ttt_enabled = _active is None or layer_idx in set(_active)
 
         # Polynomial feature map (Based arXiv:2402.18668, ATLAS arXiv:2505.23735).
-        # phi(x) = [c0, c1*x, c2*(x kron x)] so phi(q).phi(k) = c0^2 + c1^2(q.k)
-        # + c2^2(q.k)^2 -- a learnable truncation of exp(q.k), since (q kron q).
-        # (k kron k) = (q.k)^2. Capacity for a matrix memory grows with the
-        # lifted dimension, but the point here is SEPARABILITY: keys are
-        # l2-normalised onto a sphere in R^128, and near-identical keys (FDA's
-        # repeated key-value pairs) blend in the readout. Lifting spreads them.
-        #
-        # Keys are projected to ttt_feature_dim FIRST, as Based does -- the full
-        # degree-2 lift of 128 dims is 8385-dimensional and would dominate the
-        # state. d'=32 gives 1057; d'=16 gives 273.
         self.ttt_feature_map = getattr(config, 'ttt_feature_map', 'none')
         _feat_layers = getattr(config, 'ttt_feature_layers', None)
         self._lift = (self.ttt_feature_map == 'taylor2' and
@@ -300,23 +274,12 @@ class LinearTTTAttention(nn.Module):
         if self._lift:
             self.ttt_feature_dim = int(getattr(config, 'ttt_feature_dim', 32))
             dp = self.ttt_feature_dim
-            # NO CONSTANT TERM. The Taylor form [1, x, x(x)x]/||c|| puts an
-            # IDENTICAL 1/sqrt(2.5)=0.632 in every key, so phi(k).phi(k') >= 0.4
-            # for every pair -- measured mean cosine 0.414 against 0.001 for the
-            # unlifted keys, with a MINIMUM of 0.210. An l2-regression memory
-            # fitted by gradient descent cannot separate keys that all overlap
-            # that much, and the first attempt diverged (MSE 218 vs 0.43, CE
-            # worse than uniform). Based tolerates the constant because its
-            # readout is an attention-like weighted sum where a shared component
-            # is a harmless bias; fitted by descent it is not. Dropping it gives
-            # mean cosine 0.023, close to the unlifted 0.001.
+            # No constant term: a shared component makes keys inseparable for the l2 memory.
             d_feat = dp + dp * dp
             self.ttt_feat_proj = nn.Parameter(
                 torch.randn(self.num_ttt_heads, dp, self.ttt_head_dim)
                 / math.sqrt(self.ttt_head_dim))
-            # c_i, init sqrt(1/i!) so the kernel starts at 1 + (q.k) + (q.k)^2/2.
-            # c2 -> 0 recovers plain linear features, so the model can switch the
-            # lift off and the learned value is the diagnostic.
+            # c_i, init sqrt(1/i!); c2 -> 0 recovers plain linear features.
             self.ttt_feat_coef = nn.Parameter(
                 torch.tensor([1.0, 1.0 / math.sqrt(2.0)]).repeat(
                     self.num_ttt_heads, 1))
@@ -337,8 +300,7 @@ class LinearTTTAttention(nn.Module):
                     nn.Sigmoid(),
                 )
 
-            # Atlas Eq. 32's alpha_t. Only the l2 path uses it; the dot path keeps
-            # Eq. 8's renormalisation, which this would double up on.
+            # Atlas Eq. 32's alpha_t; l2 path only (dot path uses Eq. 8 renorm).
             self.ttt_retention_init_bias = getattr(config, 'ttt_retention_init_bias', 4.0)
             if self.ttt_inner_loss == 'l2':
                 self.retention_proj = nn.Sequential(
@@ -353,32 +315,19 @@ class LinearTTTAttention(nn.Module):
             self.ttt_norm = LlamaRMSNorm(self.ttt_head_dim, eps=config.rms_norm_eps)
             self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_ttt_heads)
             self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
-            # 'sigmoid' makes the gate a true mixing weight gamma in [0,1]:
-            # o = gamma * o_ttt + o_swa. 'silu' spans (-0.2785, inf) and is
-            # NON-monotonic near zero, so gamma=0 is reachable only through a
-            # -0.2785 detour -- the branch cannot cleanly learn to shut off.
+            # 'sigmoid': o = gamma * o_ttt + o_swa with gamma in [0, 1]; 'silu' is non-monotonic.
             self.ttt_gate = getattr(config, 'ttt_gate', 'silu')
-            # Probability of zeroing the SWA branch for a sequence during
-            # training. Recipe-only: nothing about the deployed model changes.
+            # Train-only probability of zeroing the SWA branch per sequence.
             self.ttt_swa_dropout = float(getattr(config, 'ttt_swa_dropout', 0.0))
-            # Below lact_chunk_size the operator's loop never executes, so the
-            # readout is a fixed function of q with zero context in it; zeroing
-            # it there discards nothing. Prefill only -- after a prefill that
-            # DID update the memory, decode steps have q_len 1 but a written one.
+            # Zero the readout for prefills shorter than lact_chunk_size (memory never written).
             self.ttt_idle_zero = getattr(config, 'ttt_idle_zero', False)
             self.fw_init_gain = gain
 
-        # Incremental decode cache: the converged fast weights plus a rolling
-        # k/v window, set at the end of prefill. None means "not decoding".
         self._share_gid = None
         self._share_leader = True    # meaningless unless _share_gid is set
         self._share_size = 1
         self._share_leader_idx = None
-        # Shared-memory group, one writer and N readers. The leader runs the
-        # inner loop and publishes its per-chunk trajectory; the other members
-        # read block c with their own q, which is causal because block c is the
-        # state before chunk c was folded in. Sharing the FINAL state instead
-        # would hand every reader a memory fitted on the whole sequence.
+        # Leader writes and publishes its per-chunk trajectory; readers must not use the final state.
         groups = getattr(config, 'ttt_share_groups', None) or []
         for gid, g in enumerate(groups):
             if layer_idx in g:
@@ -404,33 +353,22 @@ class LinearTTTAttention(nn.Module):
         )
         self._identity_reader_alignment = False
 
-        # reset_ttt_parameters reads _share_gid/_share_leader, so the share
-        # group must be resolved BEFORE it runs.
+        # Share group must be resolved before reset_ttt_parameters runs.
         self.reset_ttt_parameters()
 
         self._block_mask_cache = {}
 
-        # Branch ablation for the diagnostics; the branches are summed in
-        # forward, so a module hook cannot separate them.
+        # Branch ablation flags for diagnostics.
         self._ablate_ttt = False
         self._ablate_attn = False
 
     def reset_ttt_parameters(self):
-        """Initialise the parameters with no counterpart in the checkpoint.
-
-        Re-run from _init_weights: post_init() re-randomises every nn.Linear,
-        including the output gate that must start nearly closed.
-        """
+        """Initialise the parameters with no counterpart in the checkpoint."""
         if not self._ttt_enabled:
             return
-        # From the TENSOR, not ttt_head_dim: under a polynomial feature map the
-        # lifted input is 1 + d' + d'^2 wide, and hardcoding 128 would re-init
-        # w0/w2 with a std sqrt(1057/128) = 2.87x too large, silently undoing
-        # the constructor.
+        # Read dims from the tensor: the feature map changes d_in.
         d_in, d_h = self.w0.shape[2], self.w0.shape[1]
-        # A non-leader's w0/w1/w2 alias its leader's, and follower keys come
-        # back missing from a shared checkpoint so _init_weights runs on them.
-        # Without this guard it overwrites the leader's loaded values.
+        # Followers alias the leader's fast weights; re-init would overwrite the leader's.
         own_fast_weights = self._share_gid is None or self._share_leader
         with torch.no_grad():
             if own_fast_weights:
@@ -439,23 +377,18 @@ class LinearTTTAttention(nn.Module):
                 self.w2.normal_(0, 1 / math.sqrt(d_in)).mul_(self.fw_init_gain)
             self.ttt_qk_scale.fill_(1.0)
             self.ttt_qk_offset.zero_()
-            # No counterpart in the Llama checkpoint, and _init_weights handles
-            # Linear/Embedding only -- uninitialised under the meta-device path.
+            # Not in the Llama checkpoint; uninitialised under the meta-device path otherwise.
             self.ttt_norm.weight.fill_(1.0)
-            # Also absent from the Llama checkpoint and not an nn.Linear, so
-            # uninitialised under the meta-device path.
             if self._lift:
                 self.ttt_feat_proj.normal_(0, 1 / math.sqrt(self.ttt_head_dim))
                 self.ttt_feat_coef.copy_(
                     torch.tensor([1.0, 1.0 / math.sqrt(2.0)],
                                  device=self.ttt_feat_coef.device)
                     .repeat(self.num_ttt_heads, 1))
-        # Nearly closed so the host's residual stream survives step 0, but not
-        # fully: silu(0) == 0 would cut the gradient to lr_proj and the weights.
+        # Gate nearly but not fully closed: silu(0) == 0 would cut the gradient.
         nn.init.zeros_(self.ttt_scale_proj.weight)
         nn.init.constant_(self.ttt_scale_proj.bias, self.ttt_scale_init_bias)
-        # Near 1 so the memory survives between chunks: alpha^16 is 0.75 at
-        # sigmoid(4.0), 1.5e-5 at sigmoid(0.0). PRIVATE exponent -- see above.
+        # Retention near 1 so the memory survives between chunks.
         if hasattr(self, 'retention_proj'):
             nn.init.zeros_(self.retention_proj[0].weight)
             nn.init.constant_(self.retention_proj[0].bias,
@@ -480,9 +413,7 @@ class LinearTTTAttention(nn.Module):
             rearrange(x, 'b n (h d) -> (b h) n d', h=self.num_ttt_heads) for x in (q, k, v)
         )
         if self.ttt_inner_loss == 'l2':
-            # A regression bias fits ||v|| itself, which varies ~30x across
-            # heads, so one inner lr cannot serve them all. Output magnitude is
-            # set downstream by ttt_norm + ttt_scale_proj anyway.
+            # Normalise v so one inner lr serves all heads under the regression loss.
             v = l2_norm(v)
         q, k = l2_norm(q), l2_norm(k)
         if self._lift:
@@ -491,12 +422,7 @@ class LinearTTTAttention(nn.Module):
         return q, k, v
 
     def _taylor2(self, x):
-        """[(b h), n, d_head] -> [(b h), n, d' + d'^2].
-
-        x arrives l2-normalised, which is load-bearing: on the unit sphere
-        (q.k) is in [-1, 1] and the truncated series tracks exp(q.k). Off it the
-        quadratic term dominates and the map stops approximating anything.
-        """
+        """[(b h), n, d_head] -> [(b h), n, d' + d'^2]; x must be l2-normalised."""
         h = self.num_ttt_heads
         bh, n, _ = x.shape
         xh = x.view(bh // h, h, n, -1)
@@ -505,19 +431,13 @@ class LinearTTTAttention(nn.Module):
         quad = torch.einsum('bhnp,bhnq->bhnpq', xp, xp).flatten(-2)
         phi = torch.cat([c[:, 0, None, None] * xp,
                          c[:, 1, None, None] * quad], dim=-1)
-        # ||phi||^2 = c1^2 + c2^2 exactly, since ||x||=||x kron x||=1. Dividing
-        # by that CONSTANT keeps unit-norm features as c is learned, so
-        # ttt_base_lr stays calibrated. Per-sample normalisation would instead
-        # rescale the blocks unevenly and destroy the kernel's shape.
+        # ||phi||^2 = c1^2 + c2^2 exactly; divide by that constant, not per-sample.
         phi = phi / c.pow(2).sum(-1).sqrt()[:, None, None]
         return phi.reshape(bh, n, -1)
 
     def _decode_step(self, hidden_states, position_ids, position_embeddings,
                      past_key_value, bsz, q_len):
-        """One generated token, reusing the state parked by prefill.
-
-        Returns (output, aux, cache, trajectory); decode needs no trajectory.
-        """
+        """One generated token, reusing the state parked by prefill."""
         st = past_key_value.states[self.layer_idx]
         if q_len != 1:
             raise NotImplementedError(
@@ -525,10 +445,7 @@ class LinearTTTAttention(nn.Module):
                 'sampling both feed one; beam search and prompt chunking do not.'
             )
 
-        # A reader carries no memory: it borrows the leader's, which is the
-        # decode-time equivalent of reading its trajectory. The leader is the
-        # lowest index in the group, so it has already stepped this token --
-        # including any deferred chunk update -- by the time we get here.
+        # Readers borrow the leader's memory; the leader (lowest index) must step first.
         reader = self._ttt_enabled and self._share_gid is not None and not self._share_leader
         if not self._ttt_enabled:
             src = None
@@ -541,9 +458,7 @@ class LinearTTTAttention(nn.Module):
                 )
         else:
             src = st
-            # Apply first: chunk i reads weights fitted on chunks 0..i-1. The
-            # buffer can arrive full out of prefill, so checking BEFORE the
-            # readout is what matches a full-sequence forward.
+            # Apply a due chunk update BEFORE the readout to match a full-sequence forward.
             if (st['k_buf'] is not None
                     and st['k_buf'].shape[1] >= self.lact_chunk_size):
                 self._apply_deferred_chunk(st)
@@ -557,19 +472,17 @@ class LinearTTTAttention(nn.Module):
         k = repeat_kv(k, self.num_key_value_groups)
         v = repeat_kv(v, self.num_key_value_groups)
 
-        # ---- local branch: attend over the rolling window ----
+        # local branch: attend over the rolling window
         if position_embeddings is None:
             cos, sin = self.rotary_emb(v, position_ids)
         else:
             cos, sin = position_embeddings
-        # generate() can hand down embeddings spanning the whole prefix; take
-        # the tail so the rotary phase matches the token being decoded.
+        # Embeddings may span the whole prefix; take the tail.
         if cos.shape[-2] != q_len:
             cos, sin = cos[..., -q_len:, :], sin[..., -q_len:, :]
         aq, ak = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # window_size + 1: a query sees itself plus window_size of history, so
-        # every retained key is in-window and no mask is needed.
+        # window_size + 1: the query itself plus window_size of history.
         keep = self.window_size + 1
         st['k'] = torch.cat([st['k'], ak], dim=2)[:, :, -keep:]
         st['v'] = torch.cat([st['v'], v], dim=2)[:, :, -keep:]
@@ -580,13 +493,12 @@ class LinearTTTAttention(nn.Module):
             return (self.o_proj(attn_out.to(self.o_proj.weight.dtype)),
                     None, past_key_value, None)
 
-        # ---- global branch: read the frozen memory ----
-        # ttt_l2's tail-chunk readout: w1 @ (silu(w0 @ q) * (w2 @ q)).
+        # global branch: w1 @ (silu(w0 @ q) * (w2 @ q))
         ttt_q, _, _ = self._ttt_features(
             *(rearrange(x, 'b h n d -> b n (h d)') for x in (q, k, v))
         )
         w0, w1, w2 = (src[name].to(ttt_q.device) for name in ('w0', 'w1', 'w2'))
-        # Use the operator's CUDA autocast policy in both prefill and decode.
+        # Match the operator's CUDA autocast policy.
         qi = ttt_q.transpose(1, 2).to(w0.dtype)
         with torch.autocast(device_type=qi.device.type, enabled=qi.is_cuda,
                             dtype=torch.bfloat16):
@@ -604,10 +516,7 @@ class LinearTTTAttention(nn.Module):
 
         if self._ablate_attn:
             attn_out = torch.zeros_like(attn_out)
-        # A decode step always has q_len 1, so the prefill test in _merge_ttt
-        # cannot be reused here. Without this, a prompt shorter than one chunk
-        # is zeroed during prefill and then, from the very first generated
-        # token, reads fast weights the inner loop never touched.
+        # Keep zeroing the readout until the memory has actually been written.
         if self.ttt_idle_zero and not src.get('written', True):
             ttt_out = torch.zeros_like(ttt_out)
         if self._ablate_ttt:
@@ -632,7 +541,7 @@ class LinearTTTAttention(nn.Module):
         st['ret_buf'] = None if ret is None else app(st['ret_buf'], ret)
         return (out, None, past_key_value, None)
 
-    # ---- helpers shared by prefill and decode, so the two cannot drift ----
+    # helpers shared by prefill and decode
 
     def _decode_lr(self, hidden_states):
         with torch.autocast(device_type=hidden_states.device.type, enabled=False):
@@ -655,11 +564,7 @@ class LinearTTTAttention(nn.Module):
                          'b n (h d) -> (b h) n d', h=self.num_ttt_heads)
 
     def _apply_deferred_chunk(self, st):
-        """Run the one chunk update the buffered tokens are now due.
-
-        Reuses the operator: its loop means chunk_size + 1 tokens give exactly
-        one update over [0, chunk_size) plus a discarded tail readout.
-        """
+        """Run the one chunk update the buffered tokens are now due."""
         C = self.lact_chunk_size
         pad = lambda x: None if x is None else torch.cat([x[:, :C], x[:, C - 1:C]], dim=1)
         k, v = pad(st['k_buf']), pad(st['v_buf'])
@@ -713,7 +618,7 @@ class LinearTTTAttention(nn.Module):
         k = repeat_kv(k, self.num_key_value_groups)
         v = repeat_kv(v, self.num_key_value_groups)
 
-        # ---------------- local branch: sliding-window attention ----------------
+        # local branch: sliding-window attention
         if position_embeddings is None:
             cos, sin = self.rotary_emb(v, position_ids)
         else:
@@ -732,15 +637,13 @@ class LinearTTTAttention(nn.Module):
             if use_cache:
                 keep = self.window_size + 1
                 past_key_value.states[self.layer_idx] = {
-                    'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
+                    'k': ak[:, :, -keep:].detach().clone(), 'v': v[:, :, -keep:].detach().clone(),
                 }
             return (self.o_proj(attn_out.to(self.o_proj.weight.dtype)),
                     None, past_key_value, None)
 
-        # ---------------- global branch: test-time training ----------------
+        # global branch: test-time training
         if q_len <= self.lact_chunk_size:
-            # The operator's loop is empty here: no update, so the branch
-            # degenerates to a static MLP over the whole sequence.
             logger.warning_once(
                 f'seq_len ({q_len}) <= lact_chunk_size ({self.lact_chunk_size}): '
                 'the TTT fast weights receive zero updates for this batch.'
@@ -754,9 +657,7 @@ class LinearTTTAttention(nn.Module):
         reader = shared and not self._share_leader
 
         if reader:
-            # No inner loop at all: read the leader's per-chunk trajectory with
-            # this layer's own q. The leader is min(group) and layers run in
-            # index order, so its trajectory is always already published.
+            # Read the leader's trajectory; the leader must run first (lowest index).
             traj = ttt_trajectory
             if traj is None:
                 raise RuntimeError(
@@ -766,18 +667,16 @@ class LinearTTTAttention(nn.Module):
                 )
             ttt_out = read_lact_swiglu_l2(traj, ttt_q, self.lact_chunk_size)
             if use_cache:
-                # A reader owns no memory, so it parks only its attention
-                # window; decode pulls the weights from the leader.
+                # Readers park only their attention window.
                 keep = self.window_size + 1
                 past_key_value.states[self.layer_idx] = {
-                    'k': ak[:, :, -keep:].detach(),
-                    'v': v[:, :, -keep:].detach(),
+                    'k': ak[:, :, -keep:].detach().clone(),
+                    'v': v[:, :, -keep:].detach().clone(),
                 }
             return self._merge_ttt(ttt_out, attn_out, hidden_states, bsz,
                                    aq, ak, v, output_attentions, past_key_value)
 
-        # Inner-loop lr in fp32; upcast BOTH sides or bf16 projection weights
-        # give a mat1/mat2 dtype mismatch.
+        # Inner-loop lr in fp32; upcast both sides to avoid a dtype mismatch.
         with torch.autocast(device_type=hidden_states.device.type, enabled=False):
             lr = F.linear(
                 hidden_states.float(),
@@ -797,8 +696,7 @@ class LinearTTTAttention(nn.Module):
         else:
             momentum = None
 
-        # [num_ttt_heads, ...] -> [b * num_ttt_heads, ...]; a fresh copy of the
-        # initial state for every sequence in the batch.
+        # [num_ttt_heads, ...] -> [b * num_ttt_heads, ...]
         w0 = self.w0.repeat(bsz, 1, 1).float()
         w1 = self.w1.repeat(bsz, 1, 1).float()
         w2 = self.w2.repeat(bsz, 1, 1).float()
@@ -816,9 +714,7 @@ class LinearTTTAttention(nn.Module):
         else:
             ttt_op = block_causal_lact_swiglu
 
-        # Optional inference diagnostic: expose the actual per-chunk states
-        # for private memories as well. The callback runs outside the compiled
-        # operator and is never saved in a checkpoint/config.
+        # Optional inference diagnostic exposing per-chunk states.
         observer = getattr(self, '_ttt_state_observer', None)
         collect_trajectory = shared or observer is not None
         if observer is not None and (self.training or self.ttt_inner_loss != 'l2'):
@@ -874,13 +770,14 @@ class LinearTTTAttention(nn.Module):
             C = self.lact_chunk_size
             n_upd = math.ceil((q_len - C) / C) if q_len > C else 0
             r = q_len - C * n_upd
-            tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach())
+            # Own bounded storage: detached views retain the full prompt allocation.
+            tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach().clone())
             past_key_value.states[self.layer_idx] = {
                 # Decode cannot recover this from q_len: every decode step has
                 # q_len 1 whether or not prefill actually ran the inner loop.
                 'written': n_upd > 0,
                 'w0': nw0.detach(), 'w1': nw1.detach(), 'w2': nw2.detach(),
-                'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
+                'k': ak[:, :, -keep:].detach().clone(), 'v': v[:, :, -keep:].detach().clone(),
                 'k_buf': tail(ttt_k), 'v_buf': tail(ttt_v),
                 'lr_buf': [tail(lr0), tail(lr1), tail(lr2)],
                 'mom_buf': tail(momentum),

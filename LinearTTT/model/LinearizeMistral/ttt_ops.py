@@ -17,18 +17,14 @@ if not os.path.exists(_TTT_OPERATION):
 
 _spec = importlib.util.spec_from_file_location('lact_ttt_operation', _TTT_OPERATION)
 _mod = importlib.util.module_from_spec(_spec)
-# Register before exec: the operator is torch.compile'd, and when Dynamo traces
-# it, LOAD_GLOBAL resolves the function's __module__ through
-# importlib.import_module(). A module loaded only by path is not importable by
-# name, so tracing fails with ModuleNotFoundError.
+# Register before exec: Dynamo must be able to import the module by name.
 sys.modules[_spec.name] = _mod
 _spec.loader.exec_module(_mod)
 
 block_causal_lact_swiglu = _mod.block_causal_lact_swiglu
 prenorm_block_causal_lact_swiglu = _mod.prenorm_block_causal_lact_swiglu
 l2_norm = _mod.l2_norm
-# re-exported for ttt_l2.py, which reuses the update rule's pieces but swaps the
-# inner objective; sourcing them from upstream avoids a second copy.
+# re-exported for ttt_l2.py
 silu_backprop = _mod.silu_backprop
 zeropower_via_newtonschulz5 = _mod.zeropower_via_newtonschulz5
 

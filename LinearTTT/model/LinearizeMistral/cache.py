@@ -1,16 +1,17 @@
+import inspect
+
 from transformers.cache_utils import Cache
 
 
 class TTTCache(Cache):
-    """Per-request fast weights, pending chunk updates, and local attention KV.
-
-    Writers own fast weights; readers store only their local KV window. State
-    belongs to the returned cache so independent requests can be interleaved.
-    This cache supports prefill followed by single-token greedy/sampling decode.
-    """
+    """Per-request fast weights, pending chunk updates, and local attention KV."""
 
     def __init__(self):
-        super().__init__()
+        # HF 4.45 Cache takes no args; newer releases require a layers container.
+        if 'layers' in inspect.signature(Cache.__init__).parameters:
+            super().__init__(layers=[])
+        else:
+            super().__init__()
         self.states = {}
         self._seen_tokens = 0
 

@@ -5,18 +5,8 @@ from .ttt_ops import silu_backprop, zeropower_via_newtonschulz5
 
 
 def swiglu_l2_grads(w0, w1, w2, ki, vi, lr0i, lr1i, lr2i):
-    """Descent directions for one chunk under the l2 regression bias.
-
-    Args:
-        w0, w1, w2: fast weights. w0, w2: [b, dh, dk]; w1: [b, dv, dh]
-        ki: keys,   [b, l, dk]
-        vi: values, [b, dv, l]  (transposed, as in the operator's loop)
-        lr0i, lr1i, lr2i: per-token learning rates, [b, l, 1] or [b, l, d]
-
-    Returns:
-        dw0, dw1, dw2 -- to be *added* to the fast weights, i.e. already
-        negated relative to the gradient of L.
-    """
+    """Descent directions (to be added to W) for one chunk under the l2 bias."""
+    # w0, w2: [b, dh, dk]; w1: [b, dv, dh]; ki: [b, l, dk]; vi: [b, dv, l]; lr*: [b, l, 1|d]
     kT = ki.transpose(1, 2)                                  # [b, dk, l]
 
     gate_before_act = torch.bmm(w0, kT)                      # [b, dh, l]
@@ -24,13 +14,7 @@ def swiglu_l2_grads(w0, w1, w2, ki, vi, lr0i, lr1i, lr2i):
     gate = F.silu(gate_before_act, inplace=False)
     hidden = gate * hidden_before_mul                        # [b, dh, l]
 
-    # What the memory currently retrieves for these keys -- the term the
-    # dot-product bias does not have.
-    #
-    # fp32 deliberately: training drives pred -> v, so err is a difference of
-    # nearly-equal numbers exactly when the memory works, and bf16's 8 mantissa
-    # bits lose it. Only the subtraction needs the precision; err is cast back
-    # to vi's dtype and used where upstream uses vi.
+    # fp32: err = v - pred cancels catastrophically in bf16 once the memory fits.
     acc = torch.promote_types(torch.float32,
                               torch.promote_types(w1.dtype, vi.dtype))
     with torch.autocast(device_type=vi.device.type, enabled=False):
@@ -70,34 +54,12 @@ def block_causal_lact_swiglu_l2(
     return_trajectory: bool = False,
     return_decay: bool = False,
 ):
-    """Drop-in replacement for `block_causal_lact_swiglu` with the l2 bias.
-
-    Same signature plus `retention`, same apply-then-update (shifted block
-    causal) order, same output shape [b, l, dv].
-
-    `return_state` additionally returns the converged (w0, w1, w2), which a
-    shared memory and the decode path both need; upstream returns only output.
-
-    `retention` replaces upstream's renormalisation: W <- alpha * W + dW rather
-    than W <- L2Norm(W + dW) * ||W_0||. retention=None means no magnitude
-    control at all -- debugging only.
-
-    `return_trajectory` appends (T0, T1, T2), each [n_blocks, b, ...], holding
-    the weights used to READ each block: T[c] is the state before chunk c was
-    folded in, so it depends only on chunks < c. That is what a layer sharing
-    this memory must read -- the final state saw the whole sequence and handing
-    it to another layer leaks the future. n_blocks = one per applied chunk plus
-    one for the tail, and block c serves positions [c*chunk_size, ...).
-    `return_decay` appends the exact per-head retention multipliers applied by
-    this operator, [n_updates, batch*heads, 1, 1], for inference diagnostics.
-    It excludes the final read-only chunk.
-    """
+    """Drop-in replacement for `block_causal_lact_swiglu` with the l2 bias."""
+    # Readers must use the trajectory (T[c] sees only chunks < c); the final state leaks the future.
     if chunk_size < 1 or k.shape[1] < 1:
         raise ValueError('chunk_size and sequence length must be positive')
     if momentum is not None:
-        # Momentum buffers persist ACROSS chunks, so an incremental caller
-        # resuming mid-sequence must hand them back in or the state drifts from
-        # what a single pass produces.
+        # Momentum persists across chunks; incremental callers must pass init_momentum.
         if init_momentum is not None:
             dw0_momentum, dw1_momentum, dw2_momentum = init_momentum
         else:
@@ -147,12 +109,7 @@ def block_causal_lact_swiglu_l2(
             dw2_momentum = dw2
 
         if use_muon:
-            # Atlas Eq. 32 applies eta_t OUTSIDE Newton-Schulz: NS returns the
-            # nearest semi-orthogonal matrix and so discards its input's
-            # magnitude, including the per-token lr folded into dw. Upstream
-            # gets away with it because Eq. 8 rescales W afterwards; with the
-            # retention gate an unscaled orthogonal update is O(1) against ||W||
-            # and blows up. Reapply the lr as the per-head chunk mean.
+            # Atlas Eq. 32: NS discards magnitude, so reapply the per-head chunk-mean lr.
             eta0 = lr0i.mean(dim=1, keepdim=True)
             eta1 = lr1i.mean(dim=1, keepdim=True)
             eta2 = lr2i.mean(dim=1, keepdim=True)
@@ -207,15 +164,7 @@ def block_causal_lact_swiglu_l2(
 @torch.compile()
 @torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
 def read_lact_swiglu_l2(traj, q, chunk_size: int):
-    """Read a shared memory trajectory with this layer's own queries.
-
-    `traj` is the (T0, T1, T2) triple from
-    `block_causal_lact_swiglu_l2(..., return_trajectory=True)`. Block c holds
-    the weights the writer used to read positions
-    [c*chunk_size, (c+1)*chunk_size), so this readout sees only chunks < c and
-    is causal. Same arithmetic and the same [b, l, dv] output as the operator's
-    own readout -- no inner loop, because a reader never updates the memory.
-    """
+    """Causally read a shared memory trajectory with this layer's own queries."""
     T0, T1, T2 = traj
     n_blocks = T0.shape[0]
     seq_len = q.shape[1]

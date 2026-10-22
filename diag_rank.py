@@ -37,7 +37,20 @@ def spectrum_stats(s):
 
 
 def memory_owners(mods):
-    return [m for m in mods if m._share_gid is None or m._share_leader]
+    """Layers that actually fit a memory of their own.
+
+    Two filters, not one. Sharing is the obvious case -- a follower reads its
+    leader's state and never writes. The other is a deploy or striped config
+    where a layer has no memory at all: ttt_layer_indices [0,1,28,29,30,31]
+    leaves layers 2-27 as plain attention, and hybrid3 leaves every fourth
+    layer without one. Those are still LinearTTTAttention modules with
+    _share_gid None, so without the _ttt_enabled check they were registered as
+    owners, never fired, and the probe raised 'Memory observers did not run at
+    layers [2 ... 27]'.
+    """
+    return [m for m in mods
+            if getattr(m, '_ttt_enabled', True)
+            and (m._share_gid is None or m._share_leader)]
 
 
 @contextlib.contextmanager
@@ -303,7 +316,9 @@ def main():
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
-    config = OmegaConf.create(OmegaConf.to_container(OmegaConf.load(args.cfg), resolve=True))
+    # Resolve model fields on access; training-only environment variables such
+    # as TTT_ADAPTER are not required for this diagnostic.
+    config = OmegaConf.load(args.cfg)
     config.model.pretrained_model_name_or_path = args.ckpt
     config.model.max_length = args.seq_len
     model_config = build_model_config(config)
