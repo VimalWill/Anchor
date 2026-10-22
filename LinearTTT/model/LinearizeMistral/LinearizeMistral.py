@@ -132,6 +132,15 @@ def sliding_window_attention(
             'no incremental-decode path -- run generation with use_cache=False.'
         )
 
+    # Q_len <= window_size: every causal pair q_idx - kv_idx <= Q_len - 1 is
+    # already inside the window, so the mask is a no-op and plain causal SDPA is
+    # exact. This also keeps short sequences away from flex_attention, which
+    # builds a BlockMask per distinct length; enough distinct lengths exhaust
+    # Dynamo's recompile budget and fall back to an eager path that raised
+    # `CUDA error: an illegal memory access` at seq_len 78 during stage 1.
+    if Q_len <= window_size:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+
     if _force_sdpa_window or q.device.type != 'cuda':
         return _sdpa_sliding_window(q, k, v, window_size, causal, scale)
 
@@ -235,7 +244,7 @@ class LinearTTTAttention(nn.Module):
             )
 
         self.lact_chunk_size = getattr(config, 'lact_chunk_size', 512)
-        self.window_size = getattr(config, 'window_size', self.lact_chunk_size)
+        self.window_size = config.window_size_for_layer(layer_idx)
         if self.window_size < self.lact_chunk_size:
             raise ValueError(
                 f'window_size ({self.window_size}) must be >= lact_chunk_size ({self.lact_chunk_size}); '
@@ -739,7 +748,7 @@ class LinearTTTAttention(nn.Module):
             if use_cache:
                 keep = self.window_size + 1
                 past_key_value.states[self.layer_idx] = {
-                    'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
+                    'k': ak[:, :, -keep:].detach().clone(), 'v': v[:, :, -keep:].detach().clone(),
                 }
             return (self.o_proj(attn_out.to(self.o_proj.weight.dtype)),
                     None, past_key_value, None)
@@ -778,8 +787,8 @@ class LinearTTTAttention(nn.Module):
                 # window; decode pulls the weights from the leader.
                 keep = self.window_size + 1
                 past_key_value.states[self.layer_idx] = {
-                    'k': ak[:, :, -keep:].detach(),
-                    'v': v[:, :, -keep:].detach(),
+                    'k': ak[:, :, -keep:].detach().clone(),
+                    'v': v[:, :, -keep:].detach().clone(),
                 }
             return self._merge_ttt(ttt_out, attn_out, hidden_states, bsz,
                                    aq, ak, v, output_attentions, past_key_value)
@@ -882,13 +891,14 @@ class LinearTTTAttention(nn.Module):
             C = self.lact_chunk_size
             n_upd = math.ceil((q_len - C) / C) if q_len > C else 0
             r = q_len - C * n_upd
-            tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach())
+            # Own bounded storage: detached views retain the full prompt allocation.
+            tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach().clone())
             past_key_value.states[self.layer_idx] = {
                 # Decode cannot recover this from q_len: every decode step has
                 # q_len 1 whether or not prefill actually ran the inner loop.
                 'written': n_upd > 0,
                 'w0': nw0.detach(), 'w1': nw1.detach(), 'w2': nw2.detach(),
-                'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
+                'k': ak[:, :, -keep:].detach().clone(), 'v': v[:, :, -keep:].detach().clone(),
                 'k_buf': tail(ttt_k), 'v_buf': tail(ttt_v),
                 'lr_buf': [tail(lr0), tail(lr1), tail(lr2)],
                 'mom_buf': tail(momentum),

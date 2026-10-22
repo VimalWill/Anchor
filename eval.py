@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM
 from omegaconf import OmegaConf
 
 import LinearTTT  # noqa: F401
-from Training.train import build_model_config
+from Training.train import build_model_config, TTT_PARAM_KEYS
 from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
 from LinearTTT.model.LinearizeMistral.LinearizeMistral import (
     use_sdpa_sliding_window as use_mistral_sdpa_sliding_window,
@@ -24,7 +24,7 @@ from LinearTTT.model.LinearizeMistral.LinearizeMistral import (
 _PEFT_PREFIX = re.compile(r'^base_model\.model\.')
 
 
-def load_ttt_params(model, adapter, verbose=True):
+def load_ttt_params(model, adapter, verbose=True, strict=False):
     """Overlay `adapter/ttt_params.pt` onto an *unwrapped* model.
 
     ttt_params.pt is written from a PeftModel, so its keys carry peft's wrapper
@@ -35,16 +35,23 @@ def load_ttt_params(model, adapter, verbose=True):
     """
     ttt = os.path.join(adapter, 'ttt_params.pt')
     if not os.path.exists(ttt):
+        if strict:
+            raise FileNotFoundError(f'Missing TTT checkpoint: {ttt}')
         if verbose:
             print('  NOTE: no ttt_params.pt -- stage-2 TTT weights were never saved')
         return 0
     sd = torch.load(ttt, map_location='cpu')
     sd = {_PEFT_PREFIX.sub('', k): v for k, v in sd.items()}
-    # Training accumulates small reader updates in FP32. The base model was
-    # cast to BF16 before this overlay; promote BEFORE copying saved values,
-    # otherwise continuation irreversibly rounds away those updates.
+    if strict:
+        expected = {n for n, _ in model.named_parameters() if any(k in n for k in TTT_PARAM_KEYS)}
+        missing = expected - sd.keys()
+        if missing:
+            raise ValueError(f'Incomplete TTT checkpoint: {len(missing)} missing tensors, e.g. {sorted(missing)[0]}')
+    # Long-context training keeps all trainable TTT parameters in FP32, not
+    # just reader maps. Restore their saved precision BEFORE copying values;
+    # copying into the BF16 base first irreversibly rounds small updates away.
     for name, param in model.named_parameters():
-        if name.endswith('ttt_reader_alignment.weight') and name in sd:
+        if name in sd and any(key in name for key in TTT_PARAM_KEYS):
             param.data = param.data.to(dtype=sd[name].dtype)
     unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
     matched = len(sd) - len(unexpected)
@@ -60,14 +67,26 @@ def load_ttt_params(model, adapter, verbose=True):
     return matched
 
 
-def load_model(path, model_config, adapter=None, verbose=True):
+def load_model(path, model_config, adapter=None, verbose=True, strict_ttt=False):
     """Full checkpoint, optionally with PEFT adapters and saved TTT params."""
     model = AutoModelForCausalLM.from_pretrained(
         path, config=model_config, device_map={'': 0}
     ).to(torch.bfloat16)
     if adapter:
         from peft import PeftModel
-        load_ttt_params(model, adapter, verbose=verbose)
+        load_ttt_params(model, adapter, verbose=verbose, strict=strict_ttt)
+        # load_ttt_params promotes parameters to the dtype they were SAVED in,
+        # so a checkpoint trained under the continuation recipe arrives with
+        # FP32 TTT weights. Training tolerates that because every forward runs
+        # inside model_autocast; eval calls the model directly, and an FP32
+        # momentum_proj against BF16 hidden states raises
+        # 'mat1 and mat2 must have the same dtype'. Inference has no small
+        # updates to preserve, so bring them back to the base dtype.
+        promoted = sum(1 for _, q in model.named_parameters() if q.dtype != torch.bfloat16)
+        if promoted:
+            model = model.to(torch.bfloat16)
+            if verbose:
+                print(f'  cast {promoted} FP32 parameters back to BF16 for inference')
         model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
     return model.eval()
 
@@ -432,14 +451,14 @@ SUITES = {
 
 
 def ruler_task_specs(tasks, lengths):
-    """Register custom NIAH lengths as metrics as well as dataset metadata.
+    """Register RULER lengths as metrics as well as dataset metadata.
 
     Upstream NIAH YAMLs only register 4k through 128k. Requesting 2k data
     without its aggregation can fail when the harness computes the scores.
     Keep the standard lengths too: process_results can emit sentinel entries
     for them, and the upstream aggregator discards those sentinel values.
     """
-    if not lengths or not any(t.startswith('niah_') for t in tasks):
+    if not lengths or not any(t.startswith(('niah_', 'ruler_')) for t in tasks):
         return list(tasks)
     from lm_eval.tasks.ruler import common_utils
     metric_lengths = sorted(set(lengths) | {4096, 8192, 16384, 32768, 65536, 131072}
@@ -447,7 +466,7 @@ def ruler_task_specs(tasks, lengths):
     return [dict(task=t, metric_list=[
                 dict(metric=str(length), aggregation=common_utils.aggregate_metrics,
                      higher_is_better=True) for length in metric_lengths])
-            if t.startswith('niah_') else t for t in tasks]
+            if t.startswith(('niah_', 'ruler_')) else t for t in tasks]
 
 
 def resolve(tasks, metadata=None):
@@ -647,7 +666,8 @@ def main():
             cfg.model.window_size = new_w
             cfg.model.lact_chunk_size = new_c
         model_config = build_model_config(cfg)
-        model = load_model(args.ckpt, model_config, args.adapter)
+        model = load_model(args.ckpt, model_config, args.adapter,
+                           strict_ttt=config.get('data', {}).get('name') == 'long_context')
         mods = ttt_layers(model)
         if args.keep_frac is not None:
             shrink_memories(mods, args.keep_frac, args.keep_select, args.keep_seed)
@@ -755,6 +775,10 @@ def main():
                    'layers': args.layers, 'causality': causality,
                    'identity_readers': args.identity_readers,
                    'seed': args.seed, 'ruler_lengths': args.ruler_lengths,
+                   # MMLU is meaningless without it: 5-shot and 0-shot differ
+                   # by ~2 points on Llama-3.1-8B, and None means the task's
+                   # own default rather than zero.
+                   'num_fewshot': args.num_fewshot,
                    'tokenizer': args.base, 'eval_context_length': eval_len,
                    'window_size': getattr(model_config, 'window_size', None),
                    'ttt_layer_indices': getattr(model_config, 'ttt_layer_indices', None),

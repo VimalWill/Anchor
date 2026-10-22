@@ -37,20 +37,16 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
-        # --- test-time training (LaCT) branch ---
+        # test-time training (LaCT) branch
         num_ttt_heads=None,       # None -> num_attention_heads (no k/v duplication under GQA)
         ttt_inter_multi=1.0,      # SwiGLU fast-weight hidden expansion
         lact_chunk_size=512,      # tokens per fast-weight update
-        window_size=512,          # sliding-window attention span; must be >= lact_chunk_size
+        window_size=512,          # scalar or one span per layer; each >= lact_chunk_size
         ttt_base_lr=1e-2,         # base inner-loop learning rate
-        # 'dot' = LaCT Eq. 7 (Hebbian) with Eq. 8's fixed-norm renorm.
-        # 'l2'  = Atlas Eq. 9 regression with Eq. 32's retention gate instead.
-        # These are the two coherent pairings; do not cross them.
+        # 'dot': LaCT Eq. 7 + Eq. 8 renorm; 'l2': Atlas Eq. 9 + Eq. 32 retention gate.
         ttt_inner_loss='dot',
         ttt_retention_init_bias=4.0,   # sigmoid(4.0) ~ 0.982 decay per chunk
-        # Layer groups that SHARE one running fast-weight memory, GQA-style:
-        # the lowest index writes, the rest read its per-chunk trajectory with
-        # their own q. One parameter set and one live state per group.
+        # Groups sharing one fast-weight memory: lowest index writes, the rest read.
         ttt_share_groups=None,
         ttt_layer_indices=None,    # layers retaining the TTT branch; None means all
         ttt_reader_alignment='none',  # 'linear': per-reader, per-head output map
@@ -120,6 +116,14 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
         """Also called at model construction after harness config overrides."""
         if not isinstance(self.lact_chunk_size, int) or self.lact_chunk_size < 1:
             raise ValueError('lact_chunk_size must be a positive integer')
+        windows = self.window_size
+        if isinstance(windows, (list, tuple)):
+            if len(windows) != self.num_hidden_layers:
+                raise ValueError('window_size must contain one value per layer')
+        else:
+            windows = [windows]
+        if any(type(w) is not int or w < self.lact_chunk_size for w in windows):
+            raise ValueError('Every window_size must be an integer >= lact_chunk_size')
         groups = self.ttt_share_groups or []
         active = (set(range(self.num_hidden_layers)) if self.ttt_layer_indices is None
                   else set(self.ttt_layer_indices))
@@ -137,8 +141,7 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
         if self.ttt_feature_map == 'taylor2':
             if not isinstance(self.ttt_feature_dim, int) or self.ttt_feature_dim < 1:
                 raise ValueError('ttt_feature_dim must be a positive integer')
-            # 1 + d' + d'^2 replaces ttt_head_dim in w0/w2, so the state grows by
-            # roughly (1+d'+d'^2)/ttt_head_dim on those two matrices.
+            # 1 + d' + d'^2 replaces ttt_head_dim in w0/w2
             if self.ttt_feature_dim > 64:
                 raise ValueError(
                     f'ttt_feature_dim={self.ttt_feature_dim} lifts to '
@@ -154,9 +157,7 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
                         'ttt_feature_layers must be a subset of the layers that '
                         'have a TTT branch; lifting a layer with no memory does '
                         'nothing and silently misreports the state size')
-        # silu(0.1)=0.052 leaves the branch nearly shut so the pretrained residual
-        # stream survives step 0. sigmoid(0.1)=0.525 would open it halfway and
-        # wreck the model at init; sigmoid(-3.0)=0.047 matches the silu default.
+        # Gate must start nearly shut; sigmoid needs bias ~-3.0 to match silu(0.1).
         if self.ttt_gate == 'sigmoid' and self.ttt_scale_init_bias > -1.0:
             raise ValueError(
                 f'ttt_gate="sigmoid" with ttt_scale_init_bias='
@@ -186,3 +187,11 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
                     raise ValueError('ttt_inter_multi must match within each shared group')
         if self.ttt_reader_alignment != 'none' and not any(len(g) > 1 for g in groups):
             raise ValueError('Reader alignment requires at least one shared-memory reader')
+
+    def window_size_for_layer(self, layer_idx):
+        """Resolve the same per-layer span for prefill and decode caches."""
+        if isinstance(self.window_size, (list, tuple)):
+            if type(layer_idx) is not int or not 0 <= layer_idx < self.num_hidden_layers:
+                raise ValueError('Per-layer window_size requires a valid layer_idx')
+            return self.window_size[layer_idx]
+        return self.window_size
