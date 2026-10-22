@@ -7,18 +7,13 @@ from collections import Counter
 
 
 def conversation_id(row):
-    # Group variants of the same source query before selecting any turns.
+    # Dedup key: variants of the same source query share one id.
     query = row['interactions'][0]['query']
     return hashlib.sha256(' '.join(query.split()).encode()).hexdigest()
 
 
 def tokenize_conversation(row, tokenizer, first_turn=False, include_label=True):
-    """Plain role delimiters work with the Anchor-I base-model tokenizer.
-
-    All assistant spans are supervised for training. Evaluation uses only the
-    first retrieval turn; generation inputs never contain its supplied answer.
-    No packing, truncation, or invented chat special tokens.
-    """
+    """Tokenize a conversation with plain role delimiters, supervising assistant spans only."""
     turns = row['interactions'][:1] if first_turn else row['interactions']
     if not include_label and not first_turn:
         raise ValueError('Generation evaluation must use the first retrieval turn')
@@ -41,12 +36,7 @@ def tokenize_conversation(row, tokenizer, first_turn=False, include_label=True):
 
 
 def retrieval_distance(row, tokenizer):
-    """Conservative distance from the last key mention to the first question.
-
-    Recognize quoted passphrases and food/animal lists in the first answer.
-    Unknown formats or missing evidence are excluded from distance-qualified
-    evaluation. For multi-item answers, every item must be beyond the window.
-    """
+    """Conservative token distance from the last key mention to the first question, or None."""
     first = row['interactions'][0]
     quoted = re.search(r'\bis\s*:?\s*([\'\"])(.+?)\1', first['answer'])
     if quoted:
@@ -57,8 +47,7 @@ def retrieval_distance(row, tokenizer):
             return None
         values = [v.strip() for v in re.split(r',\s*(?:and\s+)?|\s+and\s+',
                                               listed.group(1)) if v.strip()]
-    # In this corpus the retrieval question is the final paragraph. Requiring
-    # this boundary avoids counting the question itself toward the distance.
+    # The retrieval question is the final paragraph; exclude it from the distance.
     parts = first['query'].rsplit('\n\n', 1)
     if len(parts) != 2 or '?' not in parts[1]:
         return None
@@ -189,8 +178,7 @@ def load_reactive_data(config, tokenizer):
             row, tokenizer, first_turn=split != 'train', include_label=split != 'test')
             for row in rows])
         dataset.tokenizer, dataset.metric = tokenizer, None
-        # Retain audit metadata outside batches; test is the generation view
-        # of validation, not an independent benchmark split.
+        # test is the generation view of validation, not an independent split.
         dataset.records = rows
         loaders[split] = DataLoader(dataset, batch_size=1, shuffle=split == 'train',
                                      collate_fn=collate_sources if mixed and split != 'test' else collate,

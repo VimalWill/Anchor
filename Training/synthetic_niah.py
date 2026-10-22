@@ -35,13 +35,7 @@ WORDS = ('mountain', 'harbour', 'lantern', 'cascade', 'meadow', 'compass',
 
 
 class SyntheticNIAH:
-    """Build repeat-haystack needle examples at a target token length.
-
-    `depth` is where the needle sits as a fraction of the filler, so depth 0
-    puts it at the start and 0.9 near the end. Sampling depths uniformly
-    matters: a model trained only on late needles learns recency, not
-    retrieval.
-    """
+    """Build repeat-haystack needle examples at a target token length."""
 
     def __init__(self, tokenizer, seed=0, templates=None):
         self.tokenizer = tokenizer
@@ -87,15 +81,11 @@ class SyntheticNIAH:
         prompt = (f'Read the following document.\n\n{context}\n\n'
                   f'Question: {question}\nAnswer: ')
 
-        # The filler is fixed text, so a 7-digit value cannot collide with it;
-        # assert rather than resample, since a hit would mean the template
-        # changed underneath us.
         if value in filler:
             raise ValueError('Needle value collides with the filler')
 
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)
-        # BPE boundaries can make encode(decode(tokens)) longer. Remove only
-        # filler and rebuild the intact needle/question until the cap is met.
+        # encode(decode(ids)) can grow at BPE boundaries; trim filler until under the cap.
         while len(ids) + answer_tokens > length:
             filler_budget -= max(1, len(ids) + answer_tokens - length)
             if filler_budget < 0:
@@ -117,8 +107,7 @@ class SyntheticNIAH:
             'prompt_tokens': len(ids),
             'input_ids': ids + answer,
             'attention_mask': [1] * (len(ids) + len(answer)),
-            # Answer-only supervision: the haystack is filler by construction
-            # and training the model to predict it is what teaches repetition.
+            # Answer-only supervision; predicting the filler would teach repetition.
             'labels': [-100] * len(ids) + answer,
         }
 
@@ -145,12 +134,7 @@ class _Rows:
 
 
 def load_synthetic_niah(config, tokenizer):
-    """Dataloaders for repeat-haystack needle retrieval, generated on the fly.
-
-    No prepared corpus: the haystack is a fixed sentence repeated, so there
-    is nothing to download or pre-tokenise. Train and validation use
-    different seeds, so the validation needles, keys and depths are unseen.
-    """
+    """Dataloaders for repeat-haystack needle retrieval, generated on the fly."""
     from torch.utils.data import DataLoader
     from transformers import DataCollatorForSeq2Seq
 
@@ -163,7 +147,7 @@ def load_synthetic_niah(config, tokenizer):
     seed = int(config.data.get('seed', 0))
     train = SyntheticNIAH(tokenizer, seed=seed).dataset(
         int(config.data.get('num_train_docs', 4000)), lengths, 'train')
-    # A different seed, so no validation key, value or depth was trained on.
+    # Distinct seed so validation keys, values and depths are unseen.
     validation = SyntheticNIAH(tokenizer, seed=seed + 10_000).dataset(
         int(config.data.get('num_val_docs', 100)), lengths, 'validation')
     print(f'-> synthetic NIAH: {len(train)} train / {len(validation)} held-out '

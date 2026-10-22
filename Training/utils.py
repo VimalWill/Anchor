@@ -18,6 +18,11 @@ def get_optimizer_and_scheduler(model, config):
         scheduler = TokenLinearScheduler(optimizer, int(config.train.max_input_tokens),
                                          int(config.train.get('warmup_tokens', 0)),
                                          float(config.train.get('min_lr', 0)))
+    elif schedule == 'token_wsd':
+        scheduler = TokenWSDScheduler(optimizer, int(config.train.max_input_tokens),
+                                      int(config.train.get('warmup_tokens', 0)),
+                                      float(config.train.get('min_lr', 0)),
+                                      float(config.train.get('cooldown_fraction', 0.2)))
     elif schedule == 'linear':
         max_steps = int(config.train.get('max_steps', -1))
         if max_steps <= 0:
@@ -37,10 +42,7 @@ def get_optimizer_and_scheduler(model, config):
     return optimizer, scheduler
 
 def count_model_params(model, requires_grad: bool = True):
-    # code form lolcats
-    """
-    Return total # of trainable parameters
-    """
+    """Return the total number of (trainable) parameters; adapted from LoLCATs."""
     if requires_grad:
         model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     else:
@@ -81,3 +83,26 @@ class TokenLinearScheduler:
 
     def load_state_dict(self, state):
         self.step_tokens(state['tokens'])
+
+
+class TokenWSDScheduler(TokenLinearScheduler):
+    """Warmup, constant, then linear cooldown over the last fraction of tokens (Hagele et al. 2024)."""
+    def __init__(self, optimizer, total_tokens, warmup_tokens=0, min_lr=0, cooldown_fraction=0.2):
+        if not 0 < cooldown_fraction <= 1:
+            raise ValueError('cooldown_fraction must lie in (0, 1]')
+        self.cooldown_start = int(total_tokens * (1 - cooldown_fraction))
+        if warmup_tokens > self.cooldown_start:
+            raise ValueError('Warmup must end before the cooldown starts')
+        super().__init__(optimizer, total_tokens, warmup_tokens, min_lr)
+
+    def step_tokens(self, tokens):
+        self.tokens = tokens
+        for group, base in zip(self.optimizer.param_groups, self.base_lrs):
+            if self.warmup_tokens and tokens < self.warmup_tokens:
+                lr = base * tokens / self.warmup_tokens
+            elif tokens < self.cooldown_start:
+                lr = base
+            else:
+                remaining = max(0, self.total_tokens - tokens)
+                lr = self.min_lr + (base - self.min_lr) * remaining / (self.total_tokens - self.cooldown_start)
+            group['lr'] = lr

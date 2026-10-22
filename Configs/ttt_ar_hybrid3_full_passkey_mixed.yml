@@ -1,19 +1,16 @@
-# Stage 2: 80% ReactiveAI conversations + 20% repeated-haystack retrieval.
-# Synthetic supervision is answer-only; validation uses unseen wording.
-# Start from stage 1, or set TTT_ADAPTER to continue the existing stage 2.
 data:
   name: reactive_passkey
   path: ReactiveAI/passkey-retrieval
   subset: to-8k
-  num_train_docs: null  # all eligible conversations except held-out queries
+  num_train_docs: null
   num_val_docs: 100
   batch_size: 8
   micro_batch_size: 1
   val_set_size: 100
   concat_data: False
-  passkey_min_distance: 2048  # strictly greater; measured to the first question
+  passkey_min_distance: 2048
   seed: 42
-  synthetic_fraction: 0.20  # example fraction, not token fraction
+  synthetic_fraction: 0.20
   synthetic_lengths: [4096, 8192, 16384]
 model:
   name: ttt_ar
@@ -21,7 +18,6 @@ model:
   max_length: 16384
   attn_varient: ttt
   lact_chunk_size: 512
-  # Eight repeats: three shared TTT+512-SWA layers, then one 16384-SWA layer.
   window_size: [512, 512, 512, 16384,
                 512, 512, 512, 16384,
                 512, 512, 512, 16384,
@@ -44,14 +40,9 @@ model:
   add_eos_token: False
   device_map: auto
 train:
-  # Optional continuation from the existing stage-2 adapter; otherwise fresh stage 2.
-  # TTT_INIT must remain the full stage-1 checkpoint used by this adapter.
   continue_adapter: ${oc.env:TTT_ADAPTER,null}
   optim: adamw_torch
   lr: 0.0001
-  # 942 eligible conversations at batch 8 is ~118 optimizer steps per epoch,
-  # so epochs 1 made max_steps unreachable: the anchor run stopped near 100
-  # with the LR still at peak, since the schedule was sized for 400.
   epochs: 4
   max_steps: 300
   max_grad_norm: 1.0

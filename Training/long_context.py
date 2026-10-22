@@ -116,8 +116,7 @@ class SyntheticGenerator:
         target = length if prompt_length else length - answer_tokens
         if target < 32:
             raise ValueError('Length too short for task and answer')
-        # Reuse a token pool for all render adjustments; preserve the full
-        # question and facts. Source documents are split before generation.
+        # Only filler is trimmed; facts and question are always kept intact.
         pool, document_ids = [], set()
         while len(pool) < length * 2:
             document = self.rng.choice(self.documents)
@@ -167,8 +166,7 @@ class SyntheticGenerator:
                          for fact in facts]
             if require_far and min(distances) < min_distance:
                 continue
-            # Reject accidental answer occurrences in the filler, which can
-            # otherwise make a distant retrieval example solvable locally.
+            # Reject answers occurring in filler; they would make retrieval solvable locally.
             filler_text = self.tokenizer.decode(pool[:filler_count], skip_special_tokens=True)
             if any(v in filler_text for v in answers):
                 continue
@@ -232,8 +230,7 @@ class BalancedContextSampler(Sampler):
         rng = random.Random(self.seed + self.epoch)
         self.epoch += 1
         for _ in range(self.size):
-            # Read current maximum on each yield: the trainer can advance the
-            # curriculum after an update without rebuilding the dataloader.
+            # Re-read max_length each yield so the curriculum can advance mid-epoch.
             eligible = self._eligible()
             tasks = sorted(eligible)
             task = rng.choices(tasks, weights=[self.weights[t] for t in tasks], k=1)[0]
@@ -280,8 +277,7 @@ def load_context_data(config, tokenizer):
 
 
 def normalize_answer(text):
-    # Exact match after whitespace/case normalization. Do not accept arbitrary
-    # substring matches or explanatory text as a successful retrieval.
+    # Normalize whitespace/case/commas for exact-match scoring.
     text = re.sub(r'\s+', ' ', text.strip()).casefold()
     return re.sub(r'\s*,\s*', ',', text)
 
@@ -339,9 +335,7 @@ def retrieval_validation(model, tokenizer, rows, per_cell=4, max_new_tokens=256,
         cell_recalls.append(recall)
         length_recalls[length].append(recall)
     if samples_path is not None:
-        # Append: each eval truncated the file, so only the newest step
-        # survived and no trend across steps could ever be measured. The
-        # dataset writers in prepare_long_context still truncate.
+        # Append so samples from every eval step are kept.
         write_jsonl(samples_path, samples, append=True)
     return {'eval/retrieval_accuracy': sum(cell_scores) / len(cell_scores),
             'eval/retrieval_substring_recall': sum(cell_recalls) / len(cell_recalls),

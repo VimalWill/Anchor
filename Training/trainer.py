@@ -29,32 +29,25 @@ from peft import PeftModel
 from Training.utils import model_autocast
 
 def save_checkpoint(model, tokenizer, save_path):
-    """Save a checkpoint, including TTT parameters under PEFT.
-
-    PeftModel.save_pretrained writes only adapter weights. The TTT parameters
-    (w0/w1/w2, lr_proj, ttt_scale_proj, ...) are plain base-model tensors that
-    training also updates, so they would be silently dropped -- measured once as
-    an 18.9MB stage-2 checkpoint containing nothing but LoRA.
-
-    Shared TTT memories need the follower copies dropped by hand. safetensors
-    refuses to write tensors that alias each other, and declaring them in
-    _tied_weights_keys was not enough -- transformers' own dedup pass let them
-    through and the failure surfaced deeper, inside safe_save_file. Removing
-    them from the state dict is explicit and version-independent. Loading is
-    unaffected: the follower keys come back as missing and tie_weights()
-    re-aliases them to their leader, which is where the values live.
-    """
+    """Save a checkpoint; under PEFT the trainable TTT tensors go to ttt_params.pt."""
     sd = None
     groups = getattr(getattr(model, 'config', None), 'ttt_share_groups', None)
     if groups:
-        # match on suffix so this works whether or not a PeftModel wrapper has
-        # prefixed every key with base_model.model.
+        # Drop aliased follower TTT memories; tie_weights() re-aliases them on load.
+        # Suffix match so keys work with or without the PeftModel prefix.
         tails = tuple(f'layers.{li}.self_attn.{w}'
                       for g in groups for li in sorted(g)[1:]
                       for w in ('w0', 'w1', 'w2'))
         sd = {k: v for k, v in model.state_dict().items() if not k.endswith(tails)}
         print(f'-> dropped {len(model.state_dict()) - len(sd)} aliased '
               f'fast-weight tensors from the checkpoint')
+        # Drop lm_head tied to the embeddings; tie_weights() re-ties it on load.
+        if not isinstance(model, PeftModel) and getattr(model.config, 'tie_word_embeddings', False):
+            embed = model.get_input_embeddings().weight
+            tied = [k for k, v in sd.items() if k.endswith('lm_head.weight')
+                    and v.untyped_storage().data_ptr() == embed.untyped_storage().data_ptr()]
+            for k in tied:
+                del sd[k]
     model.save_pretrained(save_path, state_dict=sd)
     tokenizer.save_pretrained(save_path)
     if isinstance(model, PeftModel):
@@ -66,7 +59,7 @@ def save_checkpoint(model, tokenizer, save_path):
 
 
 class DefaultTrainer():
-    # code is modified from: https://github.com/HazyResearch/lolcats/blob/main/src/trainer/default_lm.py
+    # Adapted from https://github.com/HazyResearch/lolcats/blob/main/src/trainer/default_lm.py
     def __init__(self, model, train_loader, eval_loader, args, optimizers, tokenizer, config):
         super().__init__()
         self.model = model
@@ -96,11 +89,9 @@ class DefaultTrainer():
         self.compute_loss_backprop = False  # Whether we backprop in self.compute_loss
 
         self.optimizer, self.scheduler = optimizers
-        # Plateau schedules consume validation metrics; step schedules advance
-        # only after a successful optimizer update, never on evaluation.
+        # Plateau steps on eval metrics; others step only after a successful optimizer update.
         self.scheduler_step_after_epoch = isinstance(
             self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
-        # Dataloaders
         self.train_loader = train_loader
         self.eval_loader = eval_loader
 
@@ -108,7 +99,6 @@ class DefaultTrainer():
         wandb = None
         self.wandb = wandb
 
-        # args
         self.metric_for_best_model = self.args.metric_for_best_model
         self.num_train_epochs = self.args.num_train_epochs
         self.gradient_accumulation_steps = self.args.gradient_accumulation_steps
@@ -127,14 +117,13 @@ class DefaultTrainer():
         self.print_samples = print_samples
         self.initial_eval = initial_eval
         self.save_total_limit = self.args.save_total_limit 
-        self.save_steps = self.args.save_steps # num_save_ckpt_steps
+        self.save_steps = self.args.save_steps
 
-        # Saving metrics
         self.train_metrics = {'train/loss': None, 
                               'train/epoch': None, 
                               'train/step': None}
         self.eval_metrics = {self.metric_for_best_model: None}
-        self.eval_metrics_by_step = {'eval_step': []}  # save all eval metrics
+        self.eval_metrics_by_step = {'eval_step': []}
         self.criterion = nn.CrossEntropyLoss(reduction='mean')
             
         save_results = True
@@ -149,9 +138,7 @@ class DefaultTrainer():
             self.init_checkpointing(config=config)
 
     def train(self) -> nn.Module:
-        """
-        Entire training run
-        """
+        """Run the full training loop and return the best (or final) model."""
         model = self.model
         pbar = tqdm(range(self.num_train_epochs), leave=False, colour='white', desc='Training')
         for ix, epoch in enumerate(pbar):
@@ -165,15 +152,12 @@ class DefaultTrainer():
         if self.max_input_tokens:
             if self.input_tokens < self.max_input_tokens:
                 raise RuntimeError(f'Training ended before token budget: {self.input_tokens}/{self.max_input_tokens}')
-            # The token limit rarely lands on an eval_steps boundary. Validate
-            # the final update before restoring the selected checkpoint.
+            # Token-budget runs must evaluate and save the final state.
             if self.eval_metrics_by_step['eval_step'][-1:] != [self.grad_step]:
                 self.eval_step(model, step=self.grad_step)
-            # Keep the actual final state even if no checkpoint beat the
-            # initial retrieval score. It is never silently called the best.
             self.save_latest_checkpoint(model)
 
-        if self.load_best_model_at_end:  # Return best checkpoint
+        if self.load_best_model_at_end:
             try:
                 import os
                 ckpt_path = os.path.abspath(self.best_val_checkpoint_path)
@@ -197,10 +181,7 @@ class DefaultTrainer():
                             break
                     if self.max_input_tokens and not adapter_loaded:
                         raise FileNotFoundError(f'Missing selected adapter weights in {ckpt_path}')
-                    # The adapters are only half the checkpoint -- the TTT
-                    # tensors are saved separately by save_checkpoint. Without
-                    # this the model carries the LAST step's memory with the
-                    # BEST step's adapters.
+                    # TTT tensors are saved separately from the adapters; restore them too.
                     ttt = os.path.join(ckpt_path, 'ttt_params.pt')
                     if os.path.exists(ttt):
                         sd = torch.load(ttt, map_location='cpu')
@@ -246,8 +227,7 @@ class DefaultTrainer():
             self.pending_input_tokens = 0
             self.pending_exposure = {}
             return False
-        # Each loss was divided by accumulation_steps before backward. A short
-        # final window must instead average over the batches actually present.
+        # Rescale a short final window to average over the batches actually present.
         if accumulated_batches != accumulation_steps:
             scale = accumulation_steps / accumulated_batches
             for param in params:
@@ -304,25 +284,17 @@ class DefaultTrainer():
         successful_batches = 0
         eval_for_step = False
 
-        # Initial eval
         if self.initial_eval:
             print('')
             print('-> Initial eval')
-            # Register and save the starting model too. Logging alone leaves
-            # best_val_metric at its sentinel, so the first trained checkpoint
-            # is called "best" even when it is worse than initialization.
+            # Registers the initial model as a best-checkpoint candidate.
             self.eval_step(model, step=self.grad_step)
             self.initial_eval = False
-            # compute_eval_metrics sets model.eval() and does not restore it.
-            # Without this the whole training loop runs in eval mode, which
-            # disables the `self.gradient_checkpointing and self.training`
-            # branch in LigerGLAModel.forward.
+            # compute_eval_metrics leaves eval mode on (disables gradient checkpointing).
             model.train()
         
-        # model.to(self.device)
         for ix, data in enumerate(pbar):
-            # DataCollatorForSeq2Seq returns BatchEncoding (a Mapping), not dict.
-            # Reject uncountable budget batches before doing a costly forward.
+            # BatchEncoding is a Mapping, not a dict.
             batch_tokens = 0
             if isinstance(data, Mapping) and 'input_ids' in data:
                 mask = data.get('attention_mask')
@@ -343,7 +315,6 @@ class DefaultTrainer():
             raw_loss = loss.detach().item()
             loss = loss / accum_iter
             if not self.compute_loss_backprop:
-                # loss.backward() did not occur in compute_loss
                 try:
                     loss.backward()
                 except Exception as e:
@@ -381,7 +352,6 @@ class DefaultTrainer():
                 desc += f' | {k}: {v:.3f}'
             pbar.set_description(desc)
 
-            # Logging
             if optimizer_stepped and self.grad_step % self.logging_steps == 0:
                 self.train_metrics['train/loss'] = raw_loss
                 self.train_metrics['train/loss_mean'] = mean_loss
@@ -400,12 +370,12 @@ class DefaultTrainer():
                     _eval_metrics = self.eval_step(model, step=self.grad_step)
                     print(f'Grad Step {self.grad_step} eval metrics:', _eval_metrics)
                     eval_for_step = True
-                    model.train()  # Need to set back to train mode
-                elif self.grad_step == 0 and self.save_steps < 1000 and not eval_for_step:  # hack for micros
+                    model.train()
+                elif self.grad_step == 0 and self.save_steps < 1000 and not eval_for_step:
                     _eval_metrics = self.eval_step(model, step=self.grad_step)
                     print(f'Grad Step {self.grad_step} eval metrics:', _eval_metrics)
                     eval_for_step = True
-                    model.train()  # Need to set back to train mode
+                    model.train()
                     
                 elif self.grad_step % self.eval_steps == 0 and self.grad_step > 0 and eval_for_step:
                     pass
@@ -437,12 +407,9 @@ class DefaultTrainer():
         self._last_saved_grad_step = self.grad_step
 
     def eval_step(self, model: nn.Module, step: int = None, **kwargs: any) -> dict[any]:
-        """
-        Evaluation loop over one epoch
-        """
+        """Evaluate, log metrics, and save best/periodic checkpoints."""
         step = self.grad_step if step is None else step
-        # Preserve trained weights even when accuracy stays tied at zero or
-        # the allocation ends during lengthy generated validation.
+        # Token-budget runs snapshot weights before (possibly long) validation.
         if self.max_input_tokens and self.grad_step > 0:
             self.save_latest_checkpoint(model)
         with torch.no_grad():
@@ -467,25 +434,19 @@ class DefaultTrainer():
                                 phase_max_length=getattr(getattr(self.train_loader, 'sampler', None),
                                                          'max_length', None))
                 Path(self.save_path, 'training_progress.json').write_text(json.dumps(progress, indent=2))
-            # Save results
-            if self.wandb is not None:  # log to WandB
+            if self.wandb is not None:
                 self.wandb.log(self.eval_metrics, step=self.grad_step)
 
-            if self.results_path is not None:  # log to local file
+            if self.results_path is not None:
                 self.eval_metrics_by_step['eval_step'].append(step)
                 for k, v in self.eval_metrics.items():
                     if k not in self.eval_metrics_by_step:
                         self.eval_metrics_by_step[k] = [v]
                     else:
                         self.eval_metrics_by_step[k].append(v)
-                # Inefficient, but log for experiments results
                 pd.DataFrame(self.eval_metrics_by_step).to_csv(self.results_path)
 
-            # Save best metric and checkpoint
-            # Every evaluation is eligible, including step 0 and epoch-end
-            # evaluations that do not coincide with eval_steps.
             if self.is_better(val_metric, self.best_val_metric):
-                # Reuse one directory: full checkpoints are large.
                 save_path = self.save_path + '/best_ckpt'
                 save_checkpoint(model, self.tokenizer, save_path)
                 self.best_val_checkpoint_path = save_path
@@ -509,9 +470,7 @@ class DefaultTrainer():
                             max_batches: int = None,
                             dataloader: DataLoader = None,
                             **kwargs: any) -> dict[any]:
-        """
-        One evaluation loop over a validation dataset
-        """
+        """One evaluation loop over a validation dataset."""
         max_batches = (self.max_eval_batches if max_batches is None else max_batches)
         dataloader = self.eval_loader if dataloader is None else dataloader
         pbar = tqdm(dataloader, leave=False, colour='green', desc=f'Evaluating at step {step}')
@@ -524,9 +483,7 @@ class DefaultTrainer():
                 loss, eval_metrics = self.compute_loss(model, data, return_outputs=True)
                 if not self.compute_loss_backprop:
                     loss = loss.item()  # otherwise already float
-                # The total loss goes under its own key. Filed under
-                # metric_for_best_model it collided with stage 1's
-                # 'eval/loss_ce', averaging CE with (1000*MSE + CE).
+                # Total loss under its own key so it never mixes with eval/loss_ce.
                 for k, v in [('loss_total', loss), *eval_metrics.items()]:
                     step_eval_metrics.setdefault(f'eval/{k}', []).append(v)
                 if data.get('context_tasks') == ['instruction'] and 'loss_ce' in eval_metrics:
@@ -559,18 +516,14 @@ class DefaultTrainer():
                     step=step, input_tokens=self.input_tokens).items()})
             if 'accuracy' in str(self.metric_for_best_model) and self.metric_for_best_model not in step_eval_metrics:
                 raise KeyError('Requested accuracy was not computed; refusing to select on a loss fallback')
-            # Average over batches
             for k, v in step_eval_metrics.items():
                 step_eval_metrics[k] = sum(v) / len(v)
-            # Stage 2 selects on 'eval/loss', which compute_loss never returns
-            # -- it relied on the total loss being filed here. Preserve that,
-            # but only for metrics compute_loss does not already return.
+            # Fall back to the total loss for metrics compute_loss does not return.
             if (self.metric_for_best_model is not None
                     and self.metric_for_best_model not in step_eval_metrics):
                 step_eval_metrics[self.metric_for_best_model] = \
                     step_eval_metrics['eval/loss_total']
-            # ppl is averaged per batch above (mean of exp), which upper-bounds
-            # exp(mean CE); report the consistent one alongside it.
+            # Per-batch ppl is a mean of exp, which upper-bounds exp(mean CE).
             if 'eval/loss_ce' in step_eval_metrics:
                 step_eval_metrics['eval/ppl_from_mean_ce'] = float(
                     torch.exp(torch.tensor(step_eval_metrics['eval/loss_ce'])))
@@ -580,15 +533,7 @@ class DefaultTrainer():
         return step_eval_metrics
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Attention transfer, with an LM term.
-
-        Per-layer MSE alone is not a well-posed objective here: the teacher is
-        computed from the student's own hidden states, so the target moves with
-        the student. Both can converge somewhere far off the pretrained manifold
-        while agreeing perfectly -- measured once as MSE down 941x while
-        cross-entropy went from 6.4 (untrained) to 15.7 (worse than uniform).
-        The cross-entropy term anchors it.
-        """
+        """Attention-transfer MSE plus an LM term that anchors the moving teacher target."""
         input_keys = {'input_ids', 'attention_mask'}
         data = {k: v.to(model.device) for k, v in inputs.items() if k in input_keys}
         outputs = model(**data, output_attentions=True)
@@ -598,7 +543,7 @@ class DefaultTrainer():
         self.criterion_mse = nn.MSELoss(reduction='mean')
 
         loss_mse = 0
-        n_layers = 0  # Number of layers to distill
+        n_layers = 0
         for layer_idx, attns in enumerate(outputs.attentions):
             if attns is not None:
                 loss_mse += self.criterion_mse(attns[0].float(), attns[1].float())
@@ -629,7 +574,6 @@ class DefaultTrainer():
             os.makedirs(self.save_path, exist_ok=True)
             self.results_path = os.path.join(self.save_path, 'eval_metrics.csv')
 
-        # Best metric setup
         self.best_val_metric = float('-inf') if self.greater_is_better else 1e10
         self.best_val_metric_epoch = 0
         self.best_val_metric_step = 0
@@ -667,22 +611,17 @@ class FinetuneTrainer(DefaultTrainer):
                                 **{key: supervised + 1})
             targets = labels[..., -supervised:].contiguous()
         else:
-            # Multi-turn answer masks need full logits, but FP32 trainable
-            # parameters still need autocast with the BF16 backbone.
+            # Full logits for multi-turn masks; autocast for FP32 params on a BF16 backbone.
             with model_autocast(model):
                 outputs = model(**data, output_attentions=False, use_cache=False)
             targets = labels[..., 1:].contiguous()
         outputs = outputs.get('logits')[..., :-1, :].contiguous()
-        # Flatten and compute cross-entropy loss
         outputs = outputs.view(-1, outputs.shape[-1])
         targets = targets.view(-1).to(outputs.device)
         loss = self.criterion(outputs.float(), targets)
         
         targets = targets.cpu()
-        # 'loss_ce' so compute_eval_metrics also reports ppl_from_mean_ce: the
-        # 'ppl' below is a mean of per-batch exp(CE), which Jensen-inflates above
-        # exp(mean CE) -- and exp(mean CE) is what the eval reports, i.e. what
-        # the recorded dot-path numbers (31, 18.1) are on.
+        # 'loss_ce' key lets compute_eval_metrics report ppl_from_mean_ce.
         outputs = {'loss_ce': loss.item(), 'ppl': torch.exp(loss).item(),
                    'seq_len': data['input_ids'].shape[-1]}
         return (loss, outputs) if return_outputs else loss
