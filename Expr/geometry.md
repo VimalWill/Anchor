@@ -1,14 +1,14 @@
 # Layer geometry diagnostic
 
-## Every-layer whitening and Gaussian controls
+## Per-layer weight, hidden-state, and rotation decomposition
 
-Use `diag_projection_controls.py` for the identity-covariance attribution
-experiment. It supports TTT and LoLCATs through the same loaders as the original
-diagnostic. It selects **every decoder layer by default**, including layers
-whose TTT branch is disabled, and compares every adjacent layer pair. It probes
-raw Q/K/V before RoPE and before SiLU/feature mapping.
+`diag_projection_controls.py` extracts raw Q/K/V weights and captures their
+shared hidden inputs at every decoder layer. For each native head it compares
+`x @ W.T` for actual hidden states and standard Gaussian controls, then checks
+the covariance prediction `W @ Cov(x) @ W.T`. This uses covariance directly
+and does not require full-rank whitening, so early layers are included.
 
-For the existing Llama Anchor-F checkpoint, run from the HPC repository root:
+Run on HPC from the repository root:
 
 ```bash
 python Expr/diag_projection_controls.py \
@@ -17,79 +17,25 @@ python Expr/diag_projection_controls.py \
   --ckpt /work/nvme/bgly/vwilliam/ttt-checkpoints/nonunified_v2/ttt_at_l2_longalpaca/best_ckpt \
   --adapter /work/nvme/bgly/vwilliam/ttt-checkpoints/nonunified_v2/ttt_ar_l2_longalpaca/best_ckpt \
   --base meta-llama/Llama-3.1-8B \
-  --tokens-file /work/hdd/bgly/vwilliam/geometry/llama_anchorF_8192/tokens.pt \
   --heads 0 \
-  --out /work/hdd/bgly/vwilliam/geometry/llama_anchorF_controls_all_layers
+  --out /work/hdd/bgly/vwilliam/geometry/llama_anchorF_rotation_decomp
 ```
 
-Sync `Expr/diag_projection_controls.py`, `Expr/diag_geometry.py`, and
-`Expr/diag_rank.py` to the HPC. The old token file can be reused: the new probe
-samples more positions from those same sequences. A new output directory is
-required. Use the appropriate config, checkpoint, adapter, and tokenizer for
-other architectures; do not reuse tokens across different tokenizers.
+By default it checks head 0 at every layer. Use `--all-heads` for all native
+Q/K/V heads, or `--layers 0 1` for a small run. The position cutoff and sequence
+length default to 512 and 8,192. `--tokens-file` can reuse a token file made
+earlier for the same tokenizer.
 
-The command measures head 0 at **all 32 layers**. To cover all native heads,
-replace `--heads 0` with `--all-heads`: 32 Q heads and 8 K/V heads for this
-checkpoint, without GQA duplication. This substantially increases analysis
-work. No GPU runtime has been measured. `--layers 0 1` can restrict a smoke run.
-
-There are three measured inputs and two analytic references:
-
-| Label | Input / covariance reference |
-|---|---|
-| `actual` | Captured real projection input, recomputed with merged weights in float64 |
-| `whitened` | Real input transformed with per-layer symmetric ZCA |
-| `gaussian` | The same standard Gaussian samples at every layer, with separate calibration/evaluation rows |
-| `identity_exact` | Exact population output covariance `W W.T` |
-| `supported_exact` | `W P W.T`, where P projects onto the supported calibration hidden subspace |
-
-Defaults use 8 sequences, 1,024 sampled positions each, and the first 6
-sequences for calibration: **6,144 calibration samples** versus hidden width
-4,096. The last 2 sequences evaluate fits and apply the already fitted ZCA;
-they are never used to calibrate whitening. Their covariance can differ from
-identity due to sampling and distribution shift. Gaussian output covariance
-also has finite-sample error. Biases affect the mean but not centered covariance.
-
-Full whitening is required by default, with a relative eigenvalue threshold of
-1e-8. If it is rank deficient, increase samples/sequences or investigate the
-reported spectrum. `--allow-partial-whitening` explicitly permits projection
-onto the supported subspace, but that is **not** an identity-covariance test.
-The output marks `full_identity: false` and uses `supported_exact` as the
-whitened baseline. Do not lower the threshold solely to force a full rank.
-
-The 512-token position cutoff and 8,192 sequence length carry over from the
-previous experiment. The sequence split is by PG19 book and by contiguous
-WikiText blocks; WikiText blocks are not guaranteed to be separate documents.
-
-Outputs:
-
-- `whitening_summary.csv`: rank, conditioning, and actual calibration
-  covariance error. Inspect this first.
-- `layer_summary.csv` / `layer_spectra.jsonl`: all-layer covariance traces,
-  spectra, effective ranks, and deviation from each analytic baseline.
-- `pair_summary.csv` / `pair_spectra.jsonl`: every adjacent pair, orthogonal,
-  scaled-orthogonal, and general linear held-out fits for all three inputs;
-  also covariance changes under exact identity inputs.
-- `*_covariances.pt`: full output covariance matrices for inspecting axes or
-  deriving additional subspace comparisons. Add `--save-maps` for fitted maps
-  and their polar decompositions.
-- `metadata.json`: definitions, checkpoints, code/token hashes, selected layers
-  and heads, and the completion flag.
-
-For 32 layers, 8 sequences, 1,024 samples, and hidden width 4,096, temporary
-hidden-input files require about **4 GiB per corpus** (8 GiB for both). They
-are stored under the output directory and removed when the process exits
-normally or raises a Python exception; abrupt termination can leave them.
-Activations are analyzed one layer at a time after releasing the model.
-
-Interpret covariance changes and paired fits together. Identity input removes
-the real input covariance but does not remove the weights' differing subspaces.
-If a pattern persists, weights are sufficient to generate it in this control;
-if it disappears, hidden covariance/alignment mattered. This is not a causal
-percentage decomposition or proof of the mechanism in the recurrent state.
-Whitened real inputs need not be Gaussian. Rotations of isotropic inputs are
-invisible to population covariance; shared paired Gaussian outputs provide
-the complementary alignment measurement.
+`W @ W.T` is the output covariance for isotropic Gaussian input. If its axes
+differ from the actual output covariance axes, compare against
+`W @ Cov(x) @ W.T`; close agreement with the empirical covariance shows how
+the hidden covariance reshapes the projected distribution at second order.
+The JSON reports covariance spectra, relative prediction errors, top-subspace
+overlap, and marginal distributions of weights and hidden activations. Outputs
+are JSON/JSONL summaries and `.npy` arrays only: layer Q/K/V weights and
+sampled hidden states. It produces no cross-layer comparisons, CSV, PT, or
+fitted-map files. This verifies a covariance-level explanation, not by itself
+a causal claim about the full recurrent state.
 
 ## Original crossed-projection diagnostic
 

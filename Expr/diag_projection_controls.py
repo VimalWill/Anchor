@@ -1,61 +1,27 @@
-"""Every-layer projection controls: actual, ZCA-whitened, shared N(0,I).
+"""Per-layer Q/K/V weight, hidden-state, and projected-covariance analysis.
 
-Calibrate whitening on the first fit-seqs sequences only. Native Q/K/V heads,
-before RoPE and feature maps. Compare adjacent selected layers on held-out
-paired samples. Exact WW.T is the identity-covariance baseline. Full whitening
-is required unless --allow-partial-whitening is explicitly selected.
+For each layer/head, compare W Sigma_x W.T (actual hidden inputs) with W W.T
+(isotropic Gaussian inputs), then test whether the predicted covariance
+reproduces the empirical projected covariance and its principal directions.
+Arrays are saved only as .npy; summaries and metadata are JSON/JSONL.
 """
 import argparse
-import csv
 import hashlib
 import json
 import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
-import torch.nn.functional as F
 
-from diag_geometry import compare, load_checkpoint
+from diag_geometry import load_checkpoint
 from diag_rank import checkpoint_files, load_corpora, validate_tokens
 
 
 def covariance(x):
     centered = x - x.mean(0)
     return centered.T @ centered / (len(x) - 1)
-
-
-def whiten_fit(x, rtol=1e-8, allow_partial=False):
-    """Symmetric ZCA, preserving ambient coordinates; never ridge-claim identity.
-
-    In partial mode Cov(Z) is the supported-subspace projector, not I.
-    Returned basis spans that supported subspace for exact W P W.T controls.
-    """
-    if len(x) < 2 or not torch.isfinite(x).all():
-        raise ValueError('Whitening needs at least two finite calibration samples')
-    mean = x.mean(0)
-    c = covariance(x)
-    eigenvalues, axes = torch.linalg.eigh(c)
-    threshold = max(float(eigenvalues[-1]) * rtol, torch.finfo(x.dtype).tiny)
-    keep = eigenvalues > threshold
-    rank = int(keep.sum())
-    if rank == 0:
-        raise ValueError('Hidden inputs have zero supported variance')
-    if rank != x.shape[1] and not allow_partial:
-        raise ValueError(f'Whitening rank {rank}/{x.shape[1]} from {len(x)} samples. '
-                         'Increase --samples/--fit-seqs or explicitly use --allow-partial-whitening. '
-                         'A truncated whitening is not an identity-covariance control.')
-    basis = axes[:, keep]
-    transform = (basis * eigenvalues[keep].rsqrt()) @ basis.T
-    z = (x - mean) @ transform
-    projector = basis @ basis.T
-    residual = float((covariance(z) - projector).norm() / projector.norm())
-    info = {'input_dimension': x.shape[1], 'calibration_samples': len(x), 'whitening_rank': rank,
-            'full_identity': rank == x.shape[1], 'relative_threshold': rtol,
-            'retained_condition_number': float(eigenvalues[keep][-1] / eigenvalues[keep][0]),
-            'calibration_covariance_relative_error': residual,
-            'hidden_covariance_eigenvalues': eigenvalues.flip(0).clamp_min(0).tolist()}
-    return mean, transform, basis, info
 
 
 def covariance_metrics(c):
@@ -77,6 +43,29 @@ def covariance_distance(a, b):
             'trace_normalized_difference': float((a/ta - b/tb).norm()) if ta and tb else None}
 
 
+def subspace_overlap(a, b, rank):
+    """Mean squared cosine overlap between leading covariance eigenspaces."""
+    _, ua = torch.linalg.eigh(a)
+    _, ub = torch.linalg.eigh(b)
+    ua, ub = ua[:, -rank:], ub[:, -rank:]
+    return float((ua.T @ ub).square().sum() / rank)
+
+
+def distribution_summary(x):
+    x = x.reshape(-1).double()
+    mean = x.mean()
+    centered = x - mean
+    variance = centered.square().mean()
+    std = variance.sqrt()
+    z = centered / std.clamp_min(torch.finfo(x.dtype).tiny)
+    return {'count': int(x.numel()), 'mean': float(mean), 'std': float(std),
+            'min': float(x.min()), 'q01': float(torch.quantile(x, .01)),
+            'q25': float(torch.quantile(x, .25)), 'median': float(torch.quantile(x, .5)),
+            'q75': float(torch.quantile(x, .75)), 'q99': float(torch.quantile(x, .99)),
+            'max': float(x.max()), 'skewness': float(z.pow(3).mean()),
+            'excess_kurtosis': float(z.pow(4).mean() - 3)}
+
+
 @torch.no_grad()
 def capture_inputs(backbone, layers, ids, positions, directory, sequence):
     """Stream one sampled hidden tensor per layer to temporary disk storage."""
@@ -91,7 +80,7 @@ def capture_inputs(backbone, layers, ids, positions, directory, sequence):
             if h.ndim != 3 or h.shape[0] != 1:
                 raise ValueError('Expected projection input [1, tokens, hidden]')
             sampled = h[0].index_select(0, positions.to(h.device)).detach().float().cpu()
-            torch.save(sampled, directory / f'L{index}_s{sequence}.pt')
+            np.save(directory / f'L{index}_s{sequence}.npy', sampled.numpy())
         return save
 
     try:
@@ -105,106 +94,69 @@ def capture_inputs(backbone, layers, ids, positions, directory, sequence):
         raise RuntimeError('Some layer input hooks did not run')
 
 
-def write_csv(path, rows):
-    if not rows:
-        return
-    fields = list(dict.fromkeys(k for row in rows for k, value in row.items() if not isinstance(value, list)))
-    with path.open('w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows({k: v for k, v in row.items() if k in fields} for row in rows)
-
-
 def analyze(args, specs, weights, corpora, cache, out):
     device = args.analysis_device
     layers = sorted(specs)
-    fit_count = args.fit_seqs * args.samples
     count = args.seqs * args.samples
     width = specs[layers[0]]['width']
     # CPU RNG makes the exact inputs independent of the analysis device.
     rng = torch.Generator().manual_seed(args.seed + 1000)
     gaussian = torch.randn(count, width, generator=rng, dtype=torch.float64).to(device)
-    layer_rows, pair_rows, whitening_rows = [], [], []
-    with (out / 'layer_spectra.jsonl').open('w') as spectra, (out / 'pair_spectra.jsonl').open('w') as pairs:
+    with (out / 'layer_spectra.jsonl').open('w') as spectra:
         for corpus in corpora:
-            previous, previous_covs, previous_layer = None, None, None
             for layer in layers:
                 started = time.monotonic()
-                print(f'{corpus} L{layer}: whitening and projections', flush=True)
-                hidden = torch.cat([torch.load(cache / corpus / f'L{layer}_s{s}.pt',
-                                               weights_only=True, map_location='cpu') for s in range(args.seqs)])
-                hidden = hidden.to(device, torch.float64)
-                mean, zca, basis, info = whiten_fit(hidden[:fit_count], args.whitening_rtol,
-                                                   args.allow_partial_whitening)
-                info.update(corpus=corpus, layer=layer)
-                whitening_rows.append(info)
-                with (out / f'{corpus}_L{layer}_whitening.json').open('w') as f:
-                    json.dump(info, f, allow_nan=False)
-                transformed = (hidden - mean) @ zca
-                inputs = {'actual': hidden, 'whitened': transformed, 'gaussian': gaussian}
-                current, covs, artifacts = {}, {}, {}
+                print(f'{corpus} L{layer}: hidden covariance and projections', flush=True)
+                hidden_np = np.concatenate([np.load(cache / corpus / f'L{layer}_s{s}.npy', mmap_mode='r')
+                                            for s in range(args.seqs)], axis=0)
+                np.save(out / f'{corpus}_L{layer}_hidden.npy', hidden_np)
+                hidden = torch.from_numpy(np.asarray(hidden_np)).to(device, torch.float64)
+                hidden_cov = covariance(hidden)
+                hidden_mean = hidden.mean(0)
+                hidden_summary = {'corpus': corpus, 'layer': layer,
+                    'mean_norm': float(hidden_mean.norm()),
+                    'coordinate_distribution': distribution_summary(hidden),
+                    'covariance': covariance_metrics(hidden_cov)}
+                with (out / f'{corpus}_L{layer}_hidden.json').open('w') as f:
+                    json.dump(hidden_summary, f, allow_nan=False)
                 for kind, head_specs in weights[layer].items():
                     for head, (weight, bias) in head_specs.items():
                         w = weight.to(device, torch.float64)
-                        b = bias.to(device, torch.float64) if bias is not None else None
                         exact = w @ w.T
-                        wp = w @ basis
-                        supported = wp @ wp.T
-                        artifacts[f'{kind}_h{head}_exact_identity'] = exact.cpu()
-                        artifacts[f'{kind}_h{head}_exact_supported'] = supported.cpu()
-                        for control, c in [('identity_exact', exact), ('supported_exact', supported)]:
-                            row = dict(corpus=corpus, layer=layer, feature=kind, head=head,
-                                       control=control, split='population', **covariance_metrics(c))
-                            spectra.write(json.dumps(row, allow_nan=False) + '\n')
-                            layer_rows.append(row)
-                            covs[(kind, head, control, 'population')] = c.cpu()
-                        for control, h in inputs.items():
-                            y = F.linear(h, w, b)
-                            current[(kind, head, control)] = y.cpu()
-                            for split, v in [('calibration', y[:fit_count]), ('evaluation', y[fit_count:])]:
-                                c = covariance(v)
-                                baseline = supported if control == 'whitened' else exact
-                                row = dict(corpus=corpus, layer=layer, feature=kind, head=head,
-                                           control=control, split=split,
-                                           reference='supported_exact' if control == 'whitened' else 'identity_exact',
-                                           mean_norm=float(v.mean(0).norm()),
-                                           **covariance_metrics(c), **covariance_distance(baseline, c))
-                                spectra.write(json.dumps(row, allow_nan=False) + '\n')
-                                layer_rows.append(row)
-                                covs[(kind, head, control, split)] = c.cpu()
-                                artifacts[f'{kind}_h{head}_{control}_{split}'] = c.cpu()
-                        if previous is not None:
-                            for control in inputs:
-                                key = (kind, head, control)
-                                x, y = previous[key].to(device), current[key].to(device)
-                                row, maps = compare(x[:fit_count], y[:fit_count], x[fit_count:], y[fit_count:],
-                                                    args.ridge, args.subspace_rank)
-                                row.update(corpus=corpus, layer_i=previous_layer, layer_j=layer,
-                                           feature=kind, head=head, control=control)
-                                for split in ('calibration', 'evaluation'):
-                                    key_c = (kind, head, control, split)
-                                    distances = covariance_distance(previous_covs[key_c], covs[key_c])
-                                    row.update({f'{split}_{k}': value for k, value in distances.items()})
-                                pairs.write(json.dumps(row, allow_nan=False) + '\n')
-                                pair_rows.append(row)
-                                if args.save_maps:
-                                    torch.save(maps, out / f'{corpus}_L{previous_layer}_L{layer}_{kind}_h{head}_{control}_maps.pt')
-                            for control in ('identity_exact', 'supported_exact'):
-                                key_c = (kind, head, control, 'population')
-                                row = dict(corpus=corpus, layer_i=previous_layer, layer_j=layer,
-                                           feature=kind, head=head, control=control,
-                                           **covariance_distance(previous_covs[key_c], covs[key_c]))
-                                pairs.write(json.dumps(row, allow_nan=False) + '\n')
-                                pair_rows.append(row)
-                torch.save(artifacts, out / f'{corpus}_L{layer}_covariances.pt')
-                previous, previous_covs, previous_layer = current, covs, layer
+                        predicted = w @ hidden_cov @ w.T
+                        y = hidden @ w.T
+                        empirical = covariance(y)
+                        g_out = gaussian @ w.T
+                        gaussian_cov = covariance(g_out)
+                        eval_weight = torch.linalg.eigvalsh(exact).flip(0).clamp_min(0)
+                        eval_actual = torch.linalg.eigvalsh(empirical).flip(0).clamp_min(0)
+                        row = {'corpus': corpus, 'layer': layer, 'projection': kind,
+                            'head': head, 'input_samples': len(hidden),
+                            'weight_elements': distribution_summary(weight),
+                            'weight_only_output_covariance': covariance_metrics(exact),
+                            'gaussian_output_covariance': covariance_metrics(gaussian_cov),
+                            'actual_output_covariance': covariance_metrics(empirical),
+                            'predicted_W_Sigma_WT': covariance_metrics(predicted),
+                            'weight_only_singular_values': eval_weight.sqrt().tolist(),
+                            'actual_output_singular_values': eval_actual.sqrt().tolist(),
+                            'actual_vs_weight_spectral_stretch_ratio':
+                                (eval_actual.sqrt() / eval_weight.sqrt().clamp_min(1e-30)).tolist(),
+                            'prediction_vs_empirical': covariance_distance(predicted, empirical),
+                            'weight_vs_actual_top_subspace_overlap': {
+                                str(k): subspace_overlap(exact, empirical, min(k, len(exact)))
+                                for k in (8, 16, 32, 64)},
+                            'weight_vs_gaussian_top_subspace_overlap': {
+                                str(k): subspace_overlap(exact, gaussian_cov, min(k, len(exact)))
+                                for k in (8, 16, 32, 64)},
+                            'weight_vs_actual_top_eigenvalue_ratios': {
+                                str(k): float((torch.linalg.eigvalsh(empirical).flip(0)[:k].sum() /
+                                               torch.linalg.eigvalsh(exact).flip(0)[:k].sum()).item())
+                                for k in (8, 16, 32, 64)},
+                            'interpretation_note': 'Covariance eigenspace changes are predicted by W Sigma_hidden W.T; this is a second-moment explanation, not proof of a causal mechanism.'}
+                        spectra.write(json.dumps(row, allow_nan=False) + '\n')
                 spectra.flush()
-                pairs.flush()
-                del inputs, hidden, transformed, zca, basis
+                del hidden, hidden_np, hidden_cov
                 print(f'{corpus} L{layer}: complete in {time.monotonic()-started:.1f}s', flush=True)
-    write_csv(out / 'layer_summary.csv', layer_rows)
-    write_csv(out / 'pair_summary.csv', pair_rows)
-    write_csv(out / 'whitening_summary.csv', whitening_rows)
 
 
 def main():
@@ -214,7 +166,7 @@ def main():
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--adapter')
     ap.add_argument('--base', required=True)
-    ap.add_argument('--layers', nargs='+', type=int, help='Default: EVERY decoder layer; pairs are adjacent selected layers')
+    ap.add_argument('--layers', nargs='+', type=int, help='Default: every decoder layer')
     group = ap.add_mutually_exclusive_group()
     group.add_argument('--heads', nargs='+', type=int, default=[0], help='Native heads; default head 0 at every layer')
     group.add_argument('--all-heads', action='store_true', help='All native heads, independently for Q and KV')
@@ -222,24 +174,18 @@ def main():
     ap.add_argument('--pg19-path', default='emozilla/pg19')
     ap.add_argument('--seq-len', type=int, default=8192)
     ap.add_argument('--seqs', type=int, default=8)
-    ap.add_argument('--fit-seqs', type=int, default=6)
     ap.add_argument('--samples', type=int, default=1024)
     ap.add_argument('--start-position', type=int, default=512)
-    ap.add_argument('--whitening-rtol', type=float, default=1e-8)
-    ap.add_argument('--allow-partial-whitening', action='store_true')
-    ap.add_argument('--ridge', type=float, default=1e-4)
-    ap.add_argument('--subspace-rank', type=int, default=16)
     ap.add_argument('--analysis-device', choices=['cpu', 'cuda'], default='cuda')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--tokens-file')
-    ap.add_argument('--save-maps', action='store_true')
-    ap.add_argument('--out', required=True, help='New directory; temporary hidden inputs are stored here, then removed')
+    ap.add_argument('--out', required=True, help='New directory for JSON summaries and NPY arrays')
     args = ap.parse_args()
-    if (not 1 <= args.fit_seqs < args.seqs or args.samples < 2 or args.ridge <= 0 or
-            not 0 < args.whitening_rtol < 1 or args.subspace_rank < 1 or
+    if (args.seqs < 1 or args.samples < 2 or
             not 0 <= args.start_position < args.seq_len or
-            args.samples > args.seq_len - args.start_position or min(args.heads) < 0):
-        ap.error('Invalid split, sample count, ridge, rank, threshold, heads, or positions')
+            args.samples > args.seq_len - args.start_position or
+            (not args.all_heads and (not args.heads or min(args.heads) < 0))):
+        ap.error('Invalid split, sample count, heads, or positions')
     if args.model_kind == 'ttt' and not args.cfg:
         ap.error('--cfg is required for TTT')
     if not torch.cuda.is_available():
@@ -276,6 +222,7 @@ def main():
             heads = list(range(proj.out_features // d)) if args.all_heads else sorted(set(args.heads))
             if max(heads) >= proj.out_features // d:
                 ap.error(f'Invalid {kind} head at layer {i}')
+            np.save(out / f'L{i}_{kind}_weight.npy', proj.weight.detach().float().cpu().numpy())
             weights[i][kind] = {h: (proj.weight[h*d:(h+1)*d].detach().float().cpu().clone(),
                                      proj.bias[h*d:(h+1)*d].detach().float().cpu().clone()
                                      if proj.bias is not None else None) for h in heads}
@@ -284,8 +231,6 @@ def main():
     if any({k: set(v) for k, v in weights[i].items()} !=
            {k: set(v) for k, v in weights[chosen[0]].items()} for i in chosen):
         raise ValueError('Selected layers must have matching native head counts')
-    if not args.allow_partial_whitening and args.fit_seqs * args.samples <= specs[chosen[0]]['width']:
-        ap.error('Full whitening needs more calibration samples than hidden dimensions')
     rng = torch.Generator().manual_seed(args.seed)
     positions = (torch.randperm(args.seq_len - args.start_position, generator=rng)[:args.samples]
                  + args.start_position).sort().values
@@ -297,19 +242,15 @@ def main():
                 'token_hashes': {n: hashlib.sha256(t.numpy().tobytes()).hexdigest() for n, t in corpora.items()},
                 'code_hashes': {n: hashlib.sha256(Path(__file__).with_name(n).read_bytes()).hexdigest()
                                 for n in ('diag_projection_controls.py', 'diag_geometry.py', 'diag_rank.py')},
-                'definitions': {'identity_exact': 'WW.T for population input covariance I',
-                    'supported_exact': 'W P W.T; P is the retained calibration hidden subspace projector',
-                    'whitened': 'Real hidden inputs centered/ZCA-transformed using calibration statistics only',
-                    'gaussian': 'Same standard Gaussian input samples at every layer; independent fit/test rows',
-                    'actual': 'Captured projection inputs multiplied by merged weights in float64'},
+                'definitions': {'actual_covariance': 'Empirical covariance of x @ W.T',
+                    'predicted_covariance': 'W @ Cov(x) @ W.T',
+                    'weight_only_covariance': 'W @ W.T, population covariance for standard Gaussian x',
+                    'gaussian_control': 'Shared standard Gaussian input multiplied as x_gass @ W.T'},
                 'limitations': ['No recurrent-state capture or causal attribution percentages.',
-                    'Whitening does not Gaussianize real inputs; held-out covariance need not be identity.',
-                    'Population identity covariance cannot reveal orthogonal rotations of isotropic inputs.',
-                    'Paired-output fits quantify predictability, not size of a causal effect.',
+                    'Covariance decomposition verifies a second-moment prediction, not a causal mechanism.',
                     'Raw projection geometry precedes RoPE and nonlinear feature processing.',
                     'Sequence split: PG19 books, WikiText token blocks; no uncertainty intervals.']}
     (out / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
-    torch.save({'tokenizer': args.base, 'corpora': corpora, 'sources': sources}, out / 'tokens.pt')
     with tempfile.TemporaryDirectory(prefix='.hidden_inputs_', dir=out) as temp:
         cache = Path(temp)
         for corpus, sequences in corpora.items():
