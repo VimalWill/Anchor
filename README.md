@@ -1,6 +1,10 @@
-# Anchor
+<p align="center">
+  <img src="Figures/Anchor_Logo.png" alt="Anchor logo: two llamas climbing a ship's anchor" width="200">
+</p>
 
-**Augmented Cross-Layer Recurrent State for Long-Context Retrieval**
+<h1 align="center">Anchor</h1>
+
+<p align="center"><strong>Augmented Cross-Layer Recurrent State for Long-Context Retrieval</strong></p>
 
 Anchor linearizes a pretrained Transformer (Llama-3.1-8B, Mistral-7B) into a hybrid of
 sliding-window attention (SWA, window 512) and a Test-Time Training (TTT) memory. Long-context
