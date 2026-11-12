@@ -310,12 +310,9 @@ def gate_by_layer(model, mods, ids, batch):
     return [a / max(n_calls, 1) for a in acc]
 
 
-def run_retrieval(args, model, model_config, config, mods):
-    """Per-layer x per-slice ablation sweep -> one tidy CSV, ready to plot."""
+def load_eval_seqs(args, config):
+    """args.seqs equal-length validation sequences, as CPU id tensors."""
     from Training.dataloader import load_data
-
-    chunk = model_config.lact_chunk_size
-    print(f'window_size = {model_config.window_size}, chunk = {chunk}')
 
     cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
     if args.seq_len:
@@ -331,16 +328,13 @@ def run_retrieval(args, model, model_config, config, mods):
         print(f'corpus: {cfg.data.path} -- NOTE this is the training corpus; '
               'pass --data-path for a number comparable to published AR-slice')
 
-    edges = list(args.edges) + [math.inf]
-    seqs, masks = [], []
+    seqs = []
     for b in load_data(cfg)['validation']:
         # every row, not just the first: the loader's batch is micro_batch_size
         for row in b['input_ids']:
             if len(seqs) >= args.seqs:
                 break
-            ids = row.cpu()
-            seqs.append(ids)
-            masks.append(ar_masks(ids, edges, chunk))
+            seqs.append(row.cpu())
         if len(seqs) >= args.seqs:
             break
     if not seqs:
@@ -349,6 +343,140 @@ def run_retrieval(args, model, model_config, config, mods):
     if len(lens) != 1:
         raise RuntimeError(f'ragged validation sequences {sorted(lens)}; '
                            'score_ar stacks them, so they must be equal length')
+    return seqs
+
+
+def _channel_stats(v):
+    """Channel-energy concentration of one direction v [d] (sign-free)."""
+    e = v.pow(2) / v.pow(2).sum().clamp_min(1e-300)
+    es = e.sort(descending=True).values
+    return {'top1': es[0].item(), 'top4': es[:4].sum().item(),
+            'top8': es[:8].sum().item(),
+            'pr': (1.0 / e.pow(2).sum()).item() / e.numel()}
+
+
+def run_key_geometry(args, model, config, mods):
+    """Are TTT keys channel-aligned, or does their structure live off-diagonal?
+
+    ttt_qk_scale/offset is a DIAGONAL map. That can only help if the key
+    structure sits on a few channels. Per (layer, head), from all tokens of
+    args.seqs sequences:
+      m       mean key
+      u1..u4  top right singular vectors of the centered keys (= top
+              eigenvectors of the centered covariance, accumulated in fp64)
+    For each, with e_i = v_i^2/|v|^2: top-1/4/8 energy fraction, participation
+    ratio (1/sum e^2)/d. Nulls for a random direction: pr ~ 1/3, top1 ~ 2ln(d)/d,
+    and a one-hot direction gives pr = 1/d.
+    offdiag = |offdiag(S)|_F / |S|_F for the uncentered S = K^T K / T: the part
+    of the key second moment that no diagonal preconditioner can reach.
+
+    Two stages:
+      in   silu(k), the input to the diagonal affine
+      mem  l2_norm(silu(k) * scale + offset), the key the base map sees. On
+           a taylor2 checkpoint the lift is applied after this, deterministically.
+    """
+    from LinearTTT.model.LinearizeLlama.ttt_ops import l2_norm
+
+    seqs = load_eval_seqs(args, config)
+    T_tok = seqs[0].shape[0]
+    print(f'{len(seqs)} sequences of {T_tok} tokens')
+
+    acc = [None] * len(mods)
+    checked = [False]
+
+    def mk(i, m, orig):
+        H = m.num_ttt_heads
+
+        def fn(q, k, v):
+            out = orig(q, k, v)
+            ks = F.silu(k.detach().float())                       # [b, n, inner]
+            km = ks * m.ttt_qk_scale[1].float() + m.ttt_qk_offset[1].float()
+            km = l2_norm(km.view(*km.shape[:2], H, -1))
+            ks = ks.view(*ks.shape[:2], H, -1)
+            if not checked[0] and not getattr(m, '_lift', False):
+                # the recomputed 'mem' key must be what the model actually used
+                ref = out[1].detach().float()
+                ref = ref.view(-1, H, *ref.shape[1:]).transpose(1, 2)
+                err = (ref - km).abs().max().item()
+                if err > 1e-2:
+                    raise RuntimeError(f'mem-key recompute drifted from '
+                                       f'_ttt_features: max |diff| {err:.3g}')
+                checked[0] = True
+            if acc[i] is None:
+                d = ks.shape[-1]
+                z = lambda *s: torch.zeros(*s, dtype=torch.float64, device=ks.device)
+                acc[i] = {st: [z(H, d, d), z(H, d), 0] for st in ('in', 'mem')}
+            for st, x in (('in', ks), ('mem', km)):
+                x = x.reshape(-1, H, x.shape[-1]).transpose(0, 1).double()  # [H, N, d]
+                a = acc[i][st]
+                a[0] += x.transpose(1, 2) @ x
+                a[1] += x.sum(1)
+                a[2] += x.shape[1]
+            return out
+        return fn
+
+    for i, m in enumerate(mods):
+        m._ttt_features = mk(i, m, m._ttt_features)
+    try:
+        for s in range(0, len(seqs), args.ar_batch):
+            ids = torch.stack(seqs[s:s + args.ar_batch]).to(model.device)
+            model(input_ids=ids, use_cache=False)
+    finally:
+        for m in mods:
+            del m._ttt_features          # drop the instance attr -> class method
+
+    rows = []
+    for li, (m, a) in enumerate(zip(mods, acc)):
+        if a is None:
+            print(f'layer {li}: _ttt_features never called, skipped')
+            continue
+        writer = m._share_gid is None or m._share_leader
+        for st in ('in', 'mem'):
+            S2, s1, n = a[st]
+            S = S2 / n
+            mu = s1 / n
+            C = S - mu.unsqueeze(2) * mu.unsqueeze(1)
+            evecs = torch.linalg.eigh(C).eigenvectors.flip(-1)[..., :4]  # [H, d, 4]
+            fro = S.pow(2).sum((1, 2))
+            dia = torch.diagonal(S, dim1=1, dim2=2).pow(2).sum(1)
+            off = ((fro - dia).clamp_min(0) / fro).sqrt()
+            for h in range(S.shape[0]):
+                vecs = [('m', mu[h])] + [(f'u{j + 1}', evecs[h, :, j]) for j in range(4)]
+                for name, vec in vecs:
+                    rows.append((li, h, int(writer), st, name,
+                                 _channel_stats(vec), off[h].item()))
+
+    path = f'{args.out}_key_geometry.csv'
+    with open(path, 'w') as f:
+        f.write('layer,head,writer,stage,vec,top1,top4,top8,pr,offdiag\n')
+        for li, h, w, st, name, c, off in rows:
+            f.write(f'{li},{h},{w},{st},{name},{c["top1"]:.5f},{c["top4"]:.5f},'
+                    f'{c["top8"]:.5f},{c["pr"]:.5f},{off:.5f}\n')
+
+    # per-layer medians over heads; full detail is in the CSV
+    print('\nmedian over heads  (pr null ~0.33; one-hot = 1/d)')
+    print(f'{"layer":>5} {"stage":>5} {"offdiag":>8}'
+          + ''.join(f'{v + " top4":>10}{v + " pr":>9}' for v in ('m', 'u1', 'u2')))
+    for li in sorted({r[0] for r in rows}):
+        for st in ('in', 'mem'):
+            sel = [r for r in rows if r[0] == li and r[3] == st]
+            med = lambda vec, key: float(np.median(
+                [r[5][key] for r in sel if r[4] == vec]))
+            off = float(np.median([r[6] for r in sel if r[4] == 'm']))
+            print(f'{li:>5} {st:>5} {off:>8.3f}'
+                  + ''.join(f'{med(v, "top4"):>10.3f}{med(v, "pr"):>9.3f}'
+                            for v in ('m', 'u1', 'u2')))
+    print(f'\nwrote {path}')
+
+
+def run_retrieval(args, model, model_config, config, mods):
+    """Per-layer x per-slice ablation sweep -> one tidy CSV, ready to plot."""
+    chunk = model_config.lact_chunk_size
+    print(f'window_size = {model_config.window_size}, chunk = {chunk}')
+
+    seqs = load_eval_seqs(args, config)
+    edges = list(args.edges) + [math.inf]
+    masks = [ar_masks(ids, edges, chunk) for ids in seqs]
     names = list(masks[0].keys())
     print(f'{len(seqs)} sequences of {seqs[0].shape[0]} tokens; slices {names}')
 
@@ -551,6 +679,9 @@ def main():
     # ---- AR-slice retrieval sweep (does not use lm_eval) ----
     ap.add_argument('--retrieval', action='store_true',
                     help='per-layer x retrieval-distance ablation sweep -> CSV')
+    ap.add_argument('--key-geometry', action='store_true',
+                    help='per-layer/head channel alignment of TTT keys -> CSV; '
+                         'uses --seqs/--seq-len/--data-path/--ar-batch')
     ap.add_argument('--seqs', type=int, default=32,
                     help='retrieval: validation sequences to score')
     ap.add_argument('--edges', type=int, nargs='+',
@@ -593,8 +724,8 @@ def main():
 
     # Fail before a multi-minute checkpoint load, not after.
     if args.baseline:
-        if args.retrieval:
-            raise SystemExit('--baseline has no TTT branch to sweep; drop --retrieval')
+        if args.retrieval or args.key_geometry:
+            raise SystemExit('--baseline has no TTT branch; drop --retrieval/--key-geometry')
         if args.ablate or args.identity_readers:
             raise SystemExit('--baseline has no TTT branch to ablate')
         if args.keep_frac is not None:
@@ -607,13 +738,19 @@ def main():
     elif not args.ckpt:
         raise SystemExit('--ckpt is required unless --baseline is given')
 
+    if args.retrieval and args.key_geometry:
+        raise SystemExit('--retrieval and --key-geometry are separate runs; pick one')
+    if args.key_geometry and (args.ablate or args.keep_frac is not None):
+        raise SystemExit('--key-geometry measures the unmodified model; drop '
+                         '--ablate/--keep-frac')
+
     if args.retrieval and args.ablate:
         raise SystemExit('--ablate is meaningless with --retrieval: the sweep '
                          'ablates each layer itself. Use --layers to restrict '
                          'which layers it sweeps, and --branch to pick the branch.')
 
     tasks, tm = None, None
-    if not args.retrieval:
+    if not (args.retrieval or args.key_geometry):
         tasks = args.tasks or [t for s in args.suite for t in SUITES[s]]
         meta = None
         if args.ruler_lengths:
@@ -703,6 +840,10 @@ def main():
     if args.retrieval:
         with torch.no_grad():
             run_retrieval(args, model, model_config, config, mods)
+        return
+    if args.key_geometry:
+        with torch.no_grad():
+            run_key_geometry(args, model, config, mods)
         return
 
     import lm_eval
